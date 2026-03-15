@@ -89,7 +89,7 @@ const plugin = definePlugin({
     });
 
     // Clean up Gateway connection when plugin stops
-    ctx.events.on("plugin.stopping", () => {
+    ctx.events.on("plugin.stopping", async () => {
       gateway.close();
     });
 
