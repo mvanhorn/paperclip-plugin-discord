@@ -4,7 +4,9 @@ import { COLORS } from "./constants.js";
 
 type Payload = Record<string, unknown>;
 
-export function formatIssueCreated(event: PluginEvent): DiscordMessage {
+const DEFAULT_BASE_URL = "http://localhost:3100";
+
+export function formatIssueCreated(event: PluginEvent, baseUrl?: string): DiscordMessage {
   const p = event.payload as Payload;
   const identifier = String(p.identifier ?? event.entityId);
   const title = String(p.title ?? "Untitled");
@@ -20,7 +22,6 @@ export function formatIssueCreated(event: PluginEvent): DiscordMessage {
   if (assigneeName) fields.push({ name: "Assignee", value: assigneeName, inline: true });
   if (projectName) fields.push({ name: "Project", value: projectName, inline: true });
 
-  // Include any extra payload fields not already shown
   const knownKeys = new Set(["identifier", "title", "description", "status", "priority", "assigneeName", "projectName", "assigneeAgentId", "projectId"]);
   for (const [key, value] of Object.entries(p)) {
     if (knownKeys.has(key) || value == null || value === "") continue;
@@ -30,7 +31,7 @@ export function formatIssueCreated(event: PluginEvent): DiscordMessage {
     }
   }
 
-  const dashboardUrl = `http://localhost:3100/issues/${event.entityId}`;
+  const dashboardUrl = `${baseUrl ?? DEFAULT_BASE_URL}/issues/${event.entityId}`;
 
   return {
     embeds: [
@@ -61,7 +62,7 @@ export function formatIssueCreated(event: PluginEvent): DiscordMessage {
   };
 }
 
-export function formatIssueDone(event: PluginEvent): DiscordMessage {
+export function formatIssueDone(event: PluginEvent, baseUrl?: string): DiscordMessage {
   const p = event.payload as Payload;
   const identifier = String(p.identifier ?? event.entityId);
   const title = String(p.title ?? "");
@@ -72,7 +73,7 @@ export function formatIssueDone(event: PluginEvent): DiscordMessage {
   if (status) fields.push({ name: "Status", value: `\`${status}\``, inline: true });
   if (priority) fields.push({ name: "Priority", value: `\`${priority}\``, inline: true });
 
-  const dashboardUrl = `http://localhost:3100/issues/${event.entityId}`;
+  const dashboardUrl = `${baseUrl ?? DEFAULT_BASE_URL}/issues/${event.entityId}`;
 
   return {
     embeds: [
@@ -101,7 +102,7 @@ export function formatIssueDone(event: PluginEvent): DiscordMessage {
   };
 }
 
-export function formatApprovalCreated(event: PluginEvent): DiscordMessage {
+export function formatApprovalCreated(event: PluginEvent, baseUrl?: string): DiscordMessage {
   const p = event.payload as Payload;
   const approvalType = String(p.type ?? "unknown");
   const approvalId = String(p.approvalId ?? event.entityId);
@@ -109,9 +110,8 @@ export function formatApprovalCreated(event: PluginEvent): DiscordMessage {
   const description = String(p.description ?? "");
   const agentName = String(p.agentName ?? "");
   const issueIds = Array.isArray(p.issueIds) ? p.issueIds as string[] : [];
-  const dashboardUrl = `http://localhost:3100/approvals/${approvalId}`;
+  const dashboardUrl = `${baseUrl ?? DEFAULT_BASE_URL}/approvals/${approvalId}`;
 
-  // Build embed fields for structured context
   const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
   if (agentName) fields.push({ name: "Agent", value: agentName, inline: true });
   fields.push({ name: "Type", value: `\`${approvalType}\``, inline: true });
@@ -119,7 +119,6 @@ export function formatApprovalCreated(event: PluginEvent): DiscordMessage {
     fields.push({ name: "Linked Issues", value: issueIds.join(", ") });
   }
 
-  // Render linked issues with metadata
   const linkedIssues = Array.isArray(p.linkedIssues) ? p.linkedIssues as Array<Record<string, unknown>> : [];
   if (linkedIssues.length > 0) {
     const issueLines = linkedIssues.map((issue) => {
@@ -135,7 +134,6 @@ export function formatApprovalCreated(event: PluginEvent): DiscordMessage {
     fields.push({ name: `Linked Issues (${linkedIssues.length})`, value: issueLines.join("\n\n").slice(0, 1024) });
   }
 
-  // Include any extra payload fields not already shown
   const knownKeys = new Set(["type", "approvalId", "title", "description", "agentName", "issueIds", "agentId", "runId", "linkedIssues"]);
   for (const [key, value] of Object.entries(p)) {
     if (knownKeys.has(key) || value == null || value === "") continue;
@@ -158,23 +156,23 @@ export function formatApprovalCreated(event: PluginEvent): DiscordMessage {
     ],
     components: [
       {
-        type: 1, // ActionRow
+        type: 1,
         components: [
           {
-            type: 2, // Button
-            style: 3, // Success (green)
+            type: 2,
+            style: 3,
             label: "Approve",
             custom_id: `approval_approve_${approvalId}`,
           },
           {
-            type: 2, // Button
-            style: 4, // Danger (red)
+            type: 2,
+            style: 4,
             label: "Reject",
             custom_id: `approval_reject_${approvalId}`,
           },
           {
-            type: 2, // Button
-            style: 5, // Link (opens URL)
+            type: 2,
+            style: 5,
             label: "View",
             url: dashboardUrl,
           },

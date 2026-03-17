@@ -1,5 +1,6 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { DISCORD_API_BASE, METRIC_NAMES } from "./constants.js";
+import { withRetry } from "./retry.js";
 
 export interface DiscordEmbed {
   title?: string;
@@ -67,30 +68,34 @@ export async function postEmbed(
   message: DiscordMessage,
 ): Promise<boolean> {
   try {
-    const response = await discordFetch(
-      ctx,
-      token,
-      `/channels/${channelId}/messages`,
-      {
-        method: "POST",
-        body: {
-          content: message.content,
-          embeds: message.embeds,
-          components: message.components,
+    await withRetry(async () => {
+      const response = await discordFetch(
+        ctx,
+        token,
+        `/channels/${channelId}/messages`,
+        {
+          method: "POST",
+          body: {
+            content: message.content,
+            embeds: message.embeds,
+            components: message.components,
+          },
         },
-      },
-    );
+      );
 
-    if (!response.ok) {
-      const text = await response.text();
-      ctx.logger.warn("Discord API error", {
-        status: response.status,
-        body: text,
-        channelId,
-      });
-      await ctx.metrics.write(METRIC_NAMES.failed, 1);
-      return false;
-    }
+      if (!response.ok) {
+        const text = await response.text();
+        const err = new Error(`Discord API error: ${response.status}`);
+        (err as any).status = response.status;
+        (err as any).headers = response.headers;
+        ctx.logger.warn("Discord API error", {
+          status: response.status,
+          body: text,
+          channelId,
+        });
+        throw err;
+      }
+    });
 
     await ctx.metrics.write(METRIC_NAMES.sent, 1);
     return true;

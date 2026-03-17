@@ -1,8 +1,11 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { DISCORD_API_BASE } from "./constants.js";
+import { DISCORD_API_BASE, METRIC_NAMES } from "./constants.js";
 
 const GATEWAY_VERSION = "10";
 const GATEWAY_ENCODING = "json";
+const MAX_CONSECUTIVE_FAILURES = 5;
+const MAX_BACKOFF_MS = 60_000;
+const DEFAULT_RECONNECT_MS = 5000;
 
 interface GatewayPayload {
   op: number;
@@ -68,16 +71,26 @@ export async function connectGateway(
 
   let ws: WebSocket | null = null;
   let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+  let heartbeatAckTimeout: ReturnType<typeof setTimeout> | null = null;
   let sequence: number | null = null;
   let sessionId: string | null = null;
   let resumeUrl: string | null = null;
   let closed = false;
+  let consecutiveFailures = 0;
+  let lastHeartbeatIntervalMs = 41250;
+
+  function getReconnectDelay(): number {
+    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+      return MAX_BACKOFF_MS;
+    }
+    return DEFAULT_RECONNECT_MS;
+  }
 
   function connect(url: string, resume: boolean) {
     if (closed) return;
 
     const wsUrl = `${url}/?v=${GATEWAY_VERSION}&encoding=${GATEWAY_ENCODING}`;
-    ctx.logger.info("Connecting to Discord Gateway", { resume });
+    ctx.logger.info("Connecting to Discord Gateway", { resume, consecutiveFailures });
 
     ws = new WebSocket(wsUrl);
 
@@ -94,18 +107,16 @@ export async function connectGateway(
 
       switch (payload.op) {
         case 10: {
-          // HELLO - start heartbeating
           const heartbeatMs = (payload.d as { heartbeat_interval: number }).heartbeat_interval;
+          lastHeartbeatIntervalMs = heartbeatMs;
           startHeartbeat(heartbeatMs);
 
           if (resume && sessionId) {
-            // RESUME
             ws?.send(JSON.stringify({
               op: 6,
               d: { token: `Bot ${token}`, session_id: sessionId, seq: sequence },
             }));
           } else {
-            // IDENTIFY - intents: GUILDS (1)
             ws?.send(JSON.stringify({
               op: 2,
               d: {
@@ -123,12 +134,17 @@ export async function connectGateway(
         }
 
         case 0: {
-          // DISPATCH
           if (payload.t === "READY") {
             const ready = payload.d as ReadyEvent;
             sessionId = ready.session_id;
             resumeUrl = ready.resume_gateway_url;
+            consecutiveFailures = 0;
             ctx.logger.info("Gateway ready", { sessionId });
+          }
+
+          if (payload.t === "RESUMED") {
+            consecutiveFailures = 0;
+            ctx.logger.info("Gateway resumed successfully");
           }
 
           if (payload.t === "INTERACTION_CREATE") {
@@ -146,21 +162,19 @@ export async function connectGateway(
         }
 
         case 1: {
-          // HEARTBEAT request from server
           ws?.send(JSON.stringify({ op: 1, d: sequence }));
           break;
         }
 
         case 7: {
-          // RECONNECT
           ctx.logger.info("Gateway requested reconnect");
           cleanup();
+          await ctx.metrics.write(METRIC_NAMES.gatewayReconnections, 1);
           connect(resumeUrl ?? url, true);
           break;
         }
 
         case 9: {
-          // INVALID SESSION
           const resumable = payload.d as boolean;
           ctx.logger.info("Invalid session", { resumable });
           cleanup();
@@ -168,13 +182,18 @@ export async function connectGateway(
             sessionId = null;
             sequence = null;
           }
-          // Wait 1-5s before reconnecting per Discord docs
-          setTimeout(() => connect(url, resumable), 1000 + Math.random() * 4000);
+          consecutiveFailures++;
+          await ctx.metrics.write(METRIC_NAMES.gatewayReconnections, 1);
+          const delay = 1000 + Math.random() * 4000;
+          setTimeout(() => connect(url, resumable), delay);
           break;
         }
 
         case 11: {
-          // HEARTBEAT ACK - no action needed
+          if (heartbeatAckTimeout) {
+            clearTimeout(heartbeatAckTimeout);
+            heartbeatAckTimeout = null;
+          }
           break;
         }
       }
@@ -184,8 +203,16 @@ export async function connectGateway(
       ctx.logger.info("Gateway WebSocket closed", { code: event.code, reason: event.reason });
       cleanup();
       if (!closed && event.code !== 4004) {
-        // 4004 = authentication failed, don't retry
-        setTimeout(() => connect(resumeUrl ?? url, sessionId !== null), 5000);
+        consecutiveFailures++;
+        ctx.metrics.write(METRIC_NAMES.gatewayReconnections, 1).catch(() => {});
+        const delay = getReconnectDelay();
+        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          ctx.logger.error("Gateway reconnection failing repeatedly, backing off", {
+            consecutiveFailures,
+            delayMs: delay,
+          });
+        }
+        setTimeout(() => connect(resumeUrl ?? url, sessionId !== null), delay);
       }
     };
 
@@ -198,13 +225,25 @@ export async function connectGateway(
 
   function startHeartbeat(intervalMs: number) {
     if (heartbeatInterval) clearInterval(heartbeatInterval);
-    // Send first heartbeat after jitter (0-1x interval)
+    if (heartbeatAckTimeout) clearTimeout(heartbeatAckTimeout);
+
+    const sendHeartbeat = () => {
+      ws?.send(JSON.stringify({ op: 1, d: sequence }));
+      heartbeatAckTimeout = setTimeout(() => {
+        ctx.logger.warn("Heartbeat ACK not received, forcing reconnect");
+        cleanup();
+        consecutiveFailures++;
+        ctx.metrics.write(METRIC_NAMES.gatewayReconnections, 1).catch(() => {});
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.close(4000, "Heartbeat timeout");
+        }
+      }, intervalMs * 2);
+    };
+
     const jitter = Math.random() * intervalMs;
     setTimeout(() => {
-      ws?.send(JSON.stringify({ op: 1, d: sequence }));
-      heartbeatInterval = setInterval(() => {
-        ws?.send(JSON.stringify({ op: 1, d: sequence }));
-      }, intervalMs);
+      sendHeartbeat();
+      heartbeatInterval = setInterval(sendHeartbeat, intervalMs);
     }, jitter);
   }
 
@@ -212,6 +251,10 @@ export async function connectGateway(
     if (heartbeatInterval) {
       clearInterval(heartbeatInterval);
       heartbeatInterval = null;
+    }
+    if (heartbeatAckTimeout) {
+      clearTimeout(heartbeatAckTimeout);
+      heartbeatAckTimeout = null;
     }
   }
 

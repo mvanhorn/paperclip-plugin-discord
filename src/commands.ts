@@ -1,6 +1,7 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { type DiscordEmbed, respondToInteraction } from "./discord-api.js";
 import { COLORS, METRIC_NAMES } from "./constants.js";
+import { withRetry } from "./retry.js";
 
 interface InteractionOption {
   name: string;
@@ -19,6 +20,11 @@ interface Interaction {
   type: number;
   data?: InteractionData;
   member?: { user: { username: string } };
+}
+
+export interface CommandContext {
+  baseUrl: string;
+  companyId: string;
 }
 
 function getOption(
@@ -73,25 +79,23 @@ export const SLASH_COMMANDS = [
 export async function handleInteraction(
   ctx: PluginContext,
   interaction: Interaction,
+  cmdCtx: CommandContext,
 ): Promise<unknown> {
-  // Type 1 = PING (health check from Discord)
   if (interaction.type === 1) {
     return { type: 1 }; // PONG
   }
 
-  // Type 2 = APPLICATION_COMMAND (slash command)
   if (interaction.type === 2 && interaction.data) {
     await ctx.metrics.write(METRIC_NAMES.commandsHandled, 1);
-    return handleSlashCommand(ctx, interaction.data, interaction.member);
+    return handleSlashCommand(ctx, interaction.data, interaction.member, cmdCtx);
   }
 
-  // Type 3 = MESSAGE_COMPONENT (button click)
   if (interaction.type === 3 && interaction.data) {
-    return handleButtonClick(ctx, interaction.data, interaction.member?.user.username);
+    return handleButtonClick(ctx, interaction.data, interaction.member?.user.username, cmdCtx);
   }
 
   return respondToInteraction({
-    type: 4, // CHANNEL_MESSAGE_WITH_SOURCE
+    type: 4,
     content: "Unknown interaction type.",
     ephemeral: true,
   });
@@ -101,8 +105,8 @@ async function handleSlashCommand(
   ctx: PluginContext,
   data: InteractionData,
   member?: { user: { username: string } },
+  cmdCtx?: CommandContext,
 ): Promise<unknown> {
-  // /clip has subcommands, so the first option is the subcommand
   const subcommand = data.options?.[0];
   if (!subcommand) {
     return respondToInteraction({
@@ -113,18 +117,21 @@ async function handleSlashCommand(
   }
 
   const subName = subcommand.name;
+  const companyId = cmdCtx?.companyId ?? "default";
+  const baseUrl = cmdCtx?.baseUrl ?? "http://localhost:3100";
 
   switch (subName) {
     case "status":
-      return handleStatus(ctx);
+      return handleStatus(ctx, companyId);
     case "approve":
       return handleApprove(
         ctx,
         getOption(subcommand.options ?? [], "id"),
         member?.user.username,
+        baseUrl,
       );
     case "budget":
-      return handleBudget(ctx, getOption(subcommand.options ?? [], "agent"));
+      return handleBudget(ctx, getOption(subcommand.options ?? [], "agent"), companyId);
     default:
       return respondToInteraction({
         type: 4,
@@ -134,30 +141,51 @@ async function handleSlashCommand(
   }
 }
 
-async function handleStatus(ctx: PluginContext): Promise<unknown> {
-  const embeds: DiscordEmbed[] = [
-    {
-      title: "Paperclip Status",
-      description: "Fetching agent and task status...",
-      color: COLORS.BLUE,
-      footer: { text: "Paperclip" },
-    },
-  ];
+async function handleStatus(ctx: PluginContext, companyId: string): Promise<unknown> {
+  try {
+    const agents = await ctx.agents.list({ companyId, status: "active" });
+    const issues = await ctx.issues.list({ companyId, status: "done", limit: 5 });
 
-  // TODO: use ctx.entities / ctx.agents to fetch real data
-  // For now, return a placeholder that proves the command routing works
+    const agentList = agents.length > 0
+      ? agents.map((a) => `- **${a.name ?? a.id}**`).join("\n")
+      : "No active agents";
 
-  return respondToInteraction({
-    type: 4,
-    embeds,
-    ephemeral: true,
-  });
+    const issueList = issues.length > 0
+      ? issues.map((i) => `- **${i.identifier ?? i.id}** ${i.title ?? ""}`).join("\n")
+      : "No recent completions";
+
+    const embeds: DiscordEmbed[] = [
+      {
+        title: "Paperclip Status",
+        color: COLORS.BLUE,
+        fields: [
+          { name: `Active Agents (${agents.length})`, value: agentList },
+          { name: `Recent Completions (${issues.length})`, value: issueList },
+        ],
+        footer: { text: "Paperclip" },
+        timestamp: new Date().toISOString(),
+      },
+    ];
+
+    return respondToInteraction({
+      type: 4,
+      embeds,
+      ephemeral: true,
+    });
+  } catch (error) {
+    return respondToInteraction({
+      type: 4,
+      content: `Failed to fetch status: ${error instanceof Error ? error.message : String(error)}`,
+      ephemeral: true,
+    });
+  }
 }
 
 async function handleApprove(
   ctx: PluginContext,
   approvalId: string | undefined,
   username?: string,
+  baseUrl?: string,
 ): Promise<unknown> {
   if (!approvalId) {
     return respondToInteraction({
@@ -168,12 +196,27 @@ async function handleApprove(
   }
 
   try {
-    // TODO: call ctx to resolve and approve
+    const url = `${baseUrl ?? "http://localhost:3100"}/api/approvals/${approvalId}/approve`;
+    await withRetry(() =>
+      ctx.http.fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decidedByUserId: `discord:${username ?? "unknown"}` }),
+      }),
+    );
+
+    await ctx.metrics.write(METRIC_NAMES.approvalsDecided, 1);
     ctx.logger.info("Approval via Discord", { approvalId, username });
 
     return respondToInteraction({
       type: 4,
-      content: `Approved: ${approvalId}`,
+      embeds: [{
+        title: "Approval Resolved",
+        description: `**Approved** \`${approvalId}\` by ${username ?? "Discord user"}`,
+        color: COLORS.GREEN,
+        footer: { text: "Paperclip" },
+        timestamp: new Date().toISOString(),
+      }],
       ephemeral: false,
     });
   } catch (error) {
@@ -188,6 +231,7 @@ async function handleApprove(
 async function handleBudget(
   ctx: PluginContext,
   agentQuery: string | undefined,
+  companyId: string,
 ): Promise<unknown> {
   if (!agentQuery) {
     return respondToInteraction({
@@ -197,48 +241,92 @@ async function handleBudget(
     });
   }
 
-  // TODO: lookup agent budget via ctx.agents
+  try {
+    const agents = await ctx.agents.list({ companyId });
+    const agent = agents.find(
+      (a) =>
+        a.id === agentQuery || a.name === agentQuery ||
+        a.name.toLowerCase() === agentQuery.toLowerCase(),
+    );
 
-  return respondToInteraction({
-    type: 4,
-    embeds: [
-      {
-        title: `Budget: ${agentQuery}`,
-        description: "Budget lookup not yet connected to agent API.",
-        color: COLORS.PURPLE,
-      },
-    ],
-    ephemeral: true,
-  });
+    if (!agent) {
+      return respondToInteraction({
+        type: 4,
+        content: `Agent not found: ${agentQuery}`,
+        ephemeral: true,
+      });
+    }
+
+    const agentId = agent.id;
+    const budgetState = await ctx.state.get({
+      scopeKind: "agent",
+      scopeId: agentId,
+      stateKey: "budget",
+    }) as { spent?: number; limit?: number } | null;
+
+    const spent = budgetState?.spent ?? 0;
+    const limit = budgetState?.limit ?? 0;
+    const remaining = limit - spent;
+    const pct = limit > 0 ? Math.round((spent / limit) * 100) : 0;
+
+    return respondToInteraction({
+      type: 4,
+      embeds: [
+        {
+          title: `Budget: ${agent.name ?? agentId}`,
+          color: remaining > 0 ? COLORS.GREEN : COLORS.RED,
+          fields: [
+            { name: "Spent", value: `$${spent.toFixed(2)}`, inline: true },
+            { name: "Limit", value: `$${limit.toFixed(2)}`, inline: true },
+            { name: "Remaining", value: `$${remaining.toFixed(2)} (${pct}% used)`, inline: true },
+          ],
+          footer: { text: "Paperclip" },
+          timestamp: new Date().toISOString(),
+        },
+      ],
+      ephemeral: true,
+    });
+  } catch (error) {
+    return respondToInteraction({
+      type: 4,
+      content: `Failed to look up budget for ${agentQuery}: ${error instanceof Error ? error.message : String(error)}`,
+      ephemeral: true,
+    });
+  }
 }
 
 async function handleButtonClick(
   ctx: PluginContext,
   data: InteractionData,
   username?: string,
+  cmdCtx?: CommandContext,
 ): Promise<unknown> {
   const customId = data.custom_id ?? data.name;
   const actor = username ?? "Discord user";
+  const base = cmdCtx?.baseUrl ?? "http://localhost:3100";
 
   if (customId.startsWith("approval_approve_")) {
     const approvalId = customId.replace("approval_approve_", "");
     ctx.logger.info("Approval button clicked", { approvalId, action: "approve", actor });
 
     try {
-      await ctx.http.fetch(
-        `http://localhost:3100/api/approvals/${approvalId}/approve`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ decidedByUserId: `discord:${actor}` }),
-        },
+      await withRetry(() =>
+        ctx.http.fetch(
+          `${base}/api/approvals/${approvalId}/approve`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ decidedByUserId: `discord:${actor}` }),
+          },
+        ),
       );
+      await ctx.metrics.write(METRIC_NAMES.approvalsDecided, 1);
     } catch (err) {
       ctx.logger.error("Failed to approve via API", { approvalId, error: String(err) });
     }
 
     return {
-      type: 7, // UPDATE_MESSAGE — replaces the original message
+      type: 7,
       data: {
         embeds: [{
           title: "Approval Resolved",
@@ -247,7 +335,7 @@ async function handleButtonClick(
           footer: { text: "Paperclip" },
           timestamp: new Date().toISOString(),
         }],
-        components: [], // Remove buttons
+        components: [],
       },
     };
   }
@@ -257,14 +345,17 @@ async function handleButtonClick(
     ctx.logger.info("Rejection button clicked", { approvalId, action: "reject", actor });
 
     try {
-      await ctx.http.fetch(
-        `http://localhost:3100/api/approvals/${approvalId}/reject`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ decidedByUserId: `discord:${actor}` }),
-        },
+      await withRetry(() =>
+        ctx.http.fetch(
+          `${base}/api/approvals/${approvalId}/reject`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ decidedByUserId: `discord:${actor}` }),
+          },
+        ),
       );
+      await ctx.metrics.write(METRIC_NAMES.approvalsDecided, 1);
     } catch (err) {
       ctx.logger.error("Failed to reject via API", { approvalId, error: String(err) });
     }
@@ -279,7 +370,7 @@ async function handleButtonClick(
           footer: { text: "Paperclip" },
           timestamp: new Date().toISOString(),
         }],
-        components: [], // Remove buttons
+        components: [],
       },
     };
   }

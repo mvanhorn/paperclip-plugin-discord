@@ -20,7 +20,7 @@ import {
   formatAgentRunStarted,
   formatAgentRunFinished,
 } from "./formatters.js";
-import { handleInteraction, SLASH_COMMANDS } from "./commands.js";
+import { handleInteraction, SLASH_COMMANDS, type CommandContext } from "./commands.js";
 import { runIntelligenceScan, runBackfill } from "./intelligence.js";
 import { connectGateway } from "./gateway.js";
 
@@ -38,6 +38,8 @@ type DiscordConfig = {
   enableIntelligence: boolean;
   intelligenceChannelIds: string[];
   backfillDays: number;
+  paperclipBaseUrl: string;
+  intelligenceRetentionDays: number;
 };
 
 async function resolveChannel(
@@ -65,6 +67,9 @@ const plugin = definePlugin({
     }
 
     const token = await ctx.secrets.resolve(config.discordBotTokenRef);
+    const baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
+    const retentionDays = config.intelligenceRetentionDays || 30;
+    const cmdCtx: CommandContext = { baseUrl, companyId: "default" };
 
     // --- Register slash commands with Discord ---
     if (config.defaultGuildId) {
@@ -84,24 +89,20 @@ const plugin = definePlugin({
     }
 
     // --- Gateway connection for local interaction handling ---
-    // The webhook-based interaction endpoint requires a public URL.
-    // The Gateway receives INTERACTION_CREATE events over WebSocket,
-    // so button clicks and slash commands work in local deployments too.
     const gateway = await connectGateway(ctx, token, async (interaction) => {
-      return handleInteraction(ctx, interaction as any);
+      return handleInteraction(ctx, interaction as any, cmdCtx);
     });
 
-    // Clean up Gateway connection when plugin stops
     ctx.events.on("plugin.stopping", async () => {
       gateway.close();
     });
 
-    // --- Event subscriptions (notification pattern from Slack plugin) ---
+    // --- Event subscriptions ---
 
-    const notify = async (event: PluginEvent, formatter: (e: PluginEvent) => ReturnType<typeof formatIssueCreated>, overrideChannelId?: string) => {
+    const notify = async (event: PluginEvent, formatter: (e: PluginEvent, baseUrl?: string) => ReturnType<typeof formatIssueCreated>, overrideChannelId?: string) => {
       const channelId = await resolveChannel(ctx, event.companyId, overrideChannelId || config.defaultChannelId);
       if (!channelId) return;
-      const delivered = await postEmbed(ctx, token, channelId, formatter(event));
+      const delivered = await postEmbed(ctx, token, channelId, formatter(event, baseUrl));
       if (delivered) {
         await ctx.activity.log({
           companyId: event.companyId,
@@ -138,7 +139,6 @@ const plugin = definePlugin({
       );
     }
 
-    // Always subscribe to run lifecycle for activity logging
     ctx.events.on("agent.run.started", (event: PluginEvent) =>
       notify(event, formatAgentRunStarted, config.bdPipelineChannelId),
     );
@@ -200,11 +200,13 @@ const plugin = definePlugin({
         });
         if (!raw) return { content: JSON.stringify({ signals: [], lastScanned: null }) };
 
-        const data = raw as { signals: Array<{ category: string }>; lastScanned: string };
+        const data = raw as { signals: Array<{ category: string; expiresAt?: string }>; lastScanned: string };
+        const now = new Date().toISOString();
+        const fresh = data.signals.filter((s) => !s.expiresAt || s.expiresAt > now);
         const category = p.category ? String(p.category) : null;
         const filtered = category
-          ? data.signals.filter((s) => s.category === category)
-          : data.signals;
+          ? fresh.filter((s) => s.category === category)
+          : fresh;
 
         return { content: JSON.stringify({ signals: filtered, lastScanned: data.lastScanned }) };
       },
@@ -220,6 +222,7 @@ const plugin = definePlugin({
           config.defaultGuildId,
           config.intelligenceChannelIds,
           "default",
+          retentionDays,
         );
       });
       ctx.logger.info("Intelligence scan job registered", {
@@ -248,9 +251,7 @@ const plugin = definePlugin({
         );
       }
 
-      // On-demand re-backfill action
       ctx.actions.register("trigger-backfill", async () => {
-        // Clear the flag so backfill runs fresh
         await ctx.state.set(
           { scopeKind: "company", scopeId: "default", stateKey: "discord_intelligence" },
           { signals: [], backfillComplete: false },
@@ -274,9 +275,7 @@ const plugin = definePlugin({
     if (input.endpointKey === WEBHOOK_KEYS.discordInteractions) {
       const body = input.parsedBody as Record<string, unknown>;
       if (!body) return;
-      // Handle the interaction but don't return the result
-      // (the webhook response is handled by the host)
-      await handleInteraction(input as unknown as PluginContext, body as any);
+      await handleInteraction(input as unknown as PluginContext, body as any, { baseUrl: "http://localhost:3100", companyId: "default" });
     }
   },
 

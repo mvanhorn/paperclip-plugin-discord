@@ -24,6 +24,7 @@ export interface Signal {
   channelId: string;
   timestamp: string;
   messageId: string;
+  expiresAt?: string;
 }
 
 const SIGNAL_PATTERNS: Array<{
@@ -110,12 +111,16 @@ function classifyMessage(content: string): Signal["category"] | null {
   return null;
 }
 
+const DEFAULT_RETENTION_DAYS = 30;
+
 export function extractSignals(
   messages: DiscordChannelMessage[],
   roleWeightMap: Map<string, number>,
   channelId: string,
+  retentionDays: number = DEFAULT_RETENTION_DAYS,
 ): Signal[] {
   const signals: Signal[] = [];
+  const expiresAt = new Date(Date.now() + retentionDays * 24 * 60 * 60 * 1000).toISOString();
 
   for (const msg of messages) {
     if (msg.author.username.endsWith("[bot]")) continue;
@@ -126,7 +131,6 @@ export function extractSignals(
 
     const authorWeight = getAuthorWeight(msg.member?.roles, roleWeightMap);
 
-    // Only flag maintainer_directive if the author has weight >= 3
     if (category === "maintainer_directive" && authorWeight < 3) continue;
 
     signals.push({
@@ -137,10 +141,16 @@ export function extractSignals(
       channelId,
       timestamp: msg.timestamp,
       messageId: msg.id,
+      expiresAt,
     });
   }
 
   return signals;
+}
+
+export function filterExpiredSignals(signals: Signal[]): Signal[] {
+  const now = new Date().toISOString();
+  return signals.filter((s) => !s.expiresAt || s.expiresAt > now);
 }
 
 export async function runIntelligenceScan(
@@ -149,6 +159,7 @@ export async function runIntelligenceScan(
   guildId: string,
   channelIds: string[],
   companyId: string,
+  retentionDays: number = DEFAULT_RETENTION_DAYS,
 ): Promise<Signal[]> {
   if (channelIds.length === 0) return [];
 
@@ -159,17 +170,17 @@ export async function runIntelligenceScan(
 
   for (const channelId of channelIds) {
     const messages = await getChannelMessages(ctx, token, channelId, 100);
-    const signals = extractSignals(messages, roleWeightMap, channelId);
+    const signals = extractSignals(messages, roleWeightMap, channelId, retentionDays);
     allSignals.push(...signals);
   }
 
-  // Sort by weight (highest first), then by timestamp (newest first)
-  allSignals.sort((a, b) => {
+  const freshSignals = filterExpiredSignals(allSignals);
+
+  freshSignals.sort((a, b) => {
     if (b.authorWeight !== a.authorWeight) return b.authorWeight - a.authorWeight;
     return b.timestamp.localeCompare(a.timestamp);
   });
 
-  // Store in plugin state
   await ctx.state.set(
     {
       scopeKind: "company",
@@ -177,24 +188,25 @@ export async function runIntelligenceScan(
       stateKey: "discord_intelligence",
     },
     {
-      signals: allSignals.slice(0, 50), // cap at 50 most relevant
+      signals: freshSignals.slice(0, 50),
       lastScanned: new Date().toISOString(),
       channelsScanned: channelIds.length,
     },
   );
 
-  await ctx.metrics.write(METRIC_NAMES.signalsExtracted, allSignals.length);
+  await ctx.metrics.write(METRIC_NAMES.signalsExtracted, freshSignals.length);
   ctx.logger.info("Intelligence scan complete", {
-    signals: allSignals.length,
+    signals: freshSignals.length,
     channels: channelIds.length,
   });
 
-  return allSignals;
+  return freshSignals;
 }
 
 export function mergeSignals(existing: Signal[], incoming: Signal[]): Signal[] {
-  const seen = new Set(existing.map((s) => s.messageId));
-  const merged = [...existing];
+  const fresh = filterExpiredSignals(existing);
+  const seen = new Set(fresh.map((s) => s.messageId));
+  const merged = [...fresh];
   for (const s of incoming) {
     if (!seen.has(s.messageId)) {
       merged.push(s);

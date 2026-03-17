@@ -44,6 +44,8 @@ export const METRIC_NAMES = {
   failed: "discord_notification_failures",
   commandsHandled: "discord_commands_handled",
   signalsExtracted: "discord_signals_extracted",
+  approvalsDecided: "discord_approvals_decided",
+  gatewayReconnections: "discord_gateway_reconnections",
 } as const;
 
 export const ROLE_WEIGHTS: Record<string, number> = {
