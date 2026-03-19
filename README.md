@@ -1,5 +1,7 @@
 # paperclip-plugin-discord
 
+[![npm](https://img.shields.io/npm/v/paperclip-plugin-discord)](https://www.npmjs.com/package/paperclip-plugin-discord)
+
 Bidirectional Discord integration for [Paperclip](https://github.com/paperclipai/paperclip). Push agent notifications to Discord, receive slash commands, approve requests with interactive buttons, and gather community intelligence from your server.
 
 Built on the Paperclip plugin SDK and the domain event bridge ([PR #909](https://github.com/paperclipai/paperclip/pull/909)).
