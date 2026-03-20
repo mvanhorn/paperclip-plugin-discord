@@ -243,6 +243,285 @@ describe("button clicks", () => {
   });
 });
 
+describe("escalation button clicks", () => {
+  it("parses esc_suggest_ button and resolves escalation", async () => {
+    const ctx = makeCtx({
+      state: {
+        get: vi.fn().mockResolvedValue({
+          escalationId: "esc123",
+          companyId: "default",
+          agentName: "SupportBot",
+          reason: "Customer angry",
+          suggestedReply: "I understand your concern",
+          status: "pending",
+        }),
+        set: vi.fn().mockResolvedValue(undefined),
+      },
+    });
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "esc_suggest_esc123" },
+        member: { user: { username: "admin" } },
+      },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(result.type).toBe(7);
+    expect(result.data.embeds[0].title).toContain("RESOLVED");
+    expect(result.data.embeds[0].description).toContain("Suggested reply accepted");
+  });
+
+  it("parses esc_reply_ button", async () => {
+    const ctx = makeCtx({
+      state: {
+        get: vi.fn().mockResolvedValue({
+          escalationId: "esc456",
+          companyId: "default",
+          agentName: "SupportBot",
+          reason: "Complex question",
+          status: "pending",
+        }),
+        set: vi.fn().mockResolvedValue(undefined),
+      },
+    });
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "esc_reply_esc456" },
+        member: { user: { username: "admin" } },
+      },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(result.type).toBe(7);
+    expect(result.data.embeds[0].description).toContain("replying to the customer");
+  });
+
+  it("parses esc_override_ button", async () => {
+    const ctx = makeCtx({
+      state: {
+        get: vi.fn().mockResolvedValue({
+          escalationId: "esc789",
+          companyId: "default",
+          agentName: "SupportBot",
+          reason: "Wrong answer given",
+          status: "pending",
+        }),
+        set: vi.fn().mockResolvedValue(undefined),
+      },
+    });
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "esc_override_esc789" },
+        member: { user: { username: "admin" } },
+      },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(result.type).toBe(7);
+    expect(result.data.embeds[0].title).toContain("OVERRIDDEN");
+  });
+
+  it("parses esc_dismiss_ button", async () => {
+    const ctx = makeCtx({
+      state: {
+        get: vi.fn().mockResolvedValue({
+          escalationId: "esc000",
+          companyId: "default",
+          agentName: "SupportBot",
+          reason: "False alarm",
+          status: "pending",
+        }),
+        set: vi.fn().mockResolvedValue(undefined),
+      },
+    });
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "esc_dismiss_esc000" },
+        member: { user: { username: "admin" } },
+      },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(result.type).toBe(7);
+    expect(result.data.embeds[0].title).toContain("DISMISSED");
+  });
+
+  it("returns not found for nonexistent escalation", async () => {
+    const ctx = makeCtx();
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "esc_suggest_nonexistent" },
+        member: { user: { username: "admin" } },
+      },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(result.type).toBe(4);
+    expect(result.data.content).toContain("not found");
+  });
+
+  it("returns already resolved for non-pending escalation", async () => {
+    const ctx = makeCtx({
+      state: {
+        get: vi.fn().mockResolvedValue({
+          escalationId: "esc-done",
+          companyId: "default",
+          agentName: "Bot",
+          reason: "test",
+          status: "resolved",
+        }),
+        set: vi.fn().mockResolvedValue(undefined),
+      },
+    });
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "esc_suggest_esc-done" },
+        member: { user: { username: "admin" } },
+      },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(result.type).toBe(4);
+    expect(result.data.content).toContain("already resolved");
+  });
+});
+
+describe("handoff button clicks", () => {
+  it("parses handoff_approve_ and spawns target agent", async () => {
+    const ctx = makeCtx({
+      state: {
+        get: vi.fn().mockImplementation(({ stateKey }: { stateKey: string }) => {
+          if (stateKey.startsWith("handoff_")) {
+            return Promise.resolve({
+              handoffId: "hoff123",
+              threadId: "thread-1",
+              fromAgent: "AgentA",
+              toAgent: "AgentB",
+              toAgentId: "agent-b",
+              companyId: "default",
+              reason: "Need specialist",
+              status: "pending",
+              createdAt: "2026-03-15T12:00:00Z",
+            });
+          }
+          if (stateKey.startsWith("sessions_")) {
+            return Promise.resolve({ sessions: [] });
+          }
+          return Promise.resolve(null);
+        }),
+        set: vi.fn().mockResolvedValue(undefined),
+      },
+      agents: {
+        list: vi.fn().mockResolvedValue([{ id: "agent-b", name: "AgentB" }]),
+        sessions: {
+          create: vi.fn().mockResolvedValue({ sessionId: "sess-new" }),
+          sendMessage: vi.fn().mockResolvedValue(undefined),
+          close: vi.fn(),
+        },
+        invoke: vi.fn(),
+      },
+    });
+
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "handoff_approve_hoff123" },
+        member: { user: { username: "approver" } },
+      },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(result.type).toBe(7);
+    expect(result.data.embeds[0].title).toContain("Approved");
+    expect(result.data.embeds[0].description).toContain("AgentB");
+  });
+
+  it("parses handoff_reject_ and keeps original agent", async () => {
+    const ctx = makeCtx({
+      state: {
+        get: vi.fn().mockImplementation(({ stateKey }: { stateKey: string }) => {
+          if (stateKey.startsWith("handoff_")) {
+            return Promise.resolve({
+              handoffId: "hoff456",
+              threadId: "thread-1",
+              fromAgent: "AgentA",
+              toAgent: "AgentB",
+              toAgentId: "agent-b",
+              companyId: "default",
+              reason: "Not needed",
+              status: "pending",
+              createdAt: "2026-03-15T12:00:00Z",
+            });
+          }
+          return Promise.resolve(null);
+        }),
+        set: vi.fn().mockResolvedValue(undefined),
+      },
+    });
+
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "handoff_reject_hoff456" },
+        member: { user: { username: "rejector" } },
+      },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(result.type).toBe(7);
+    expect(result.data.embeds[0].title).toContain("Rejected");
+    expect(result.data.embeds[0].description).toContain("AgentA");
+  });
+
+  it("returns not found for nonexistent handoff", async () => {
+    const ctx = makeCtx();
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "handoff_approve_nonexistent" },
+        member: { user: { username: "user" } },
+      },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(result.type).toBe(4);
+    expect(result.data.content).toContain("not found");
+  });
+});
+
+describe("unknown button clicks", () => {
+  it("returns unknown button action for unrecognized custom_id", async () => {
+    const ctx = makeCtx();
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "totally_unknown_action" },
+        member: { user: { username: "user" } },
+      },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(result.type).toBe(4);
+    expect(result.data.content).toContain("Unknown button action");
+  });
+});
+
 describe("SLASH_COMMANDS", () => {
   it("defines clip and acp commands", () => {
     expect(SLASH_COMMANDS).toHaveLength(2);

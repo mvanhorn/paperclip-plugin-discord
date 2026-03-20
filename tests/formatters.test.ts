@@ -4,6 +4,8 @@ import {
   formatIssueDone,
   formatApprovalCreated,
   formatAgentError,
+  formatAgentRunStarted,
+  formatAgentRunFinished,
 } from "../src/formatters.js";
 import { COLORS } from "../src/constants.js";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
@@ -117,5 +119,116 @@ describe("formatAgentError", () => {
     );
     const fields = msg.embeds?.[0]?.fields ?? [];
     expect(fields[0]?.value.length).toBeLessThanOrEqual(1024);
+  });
+
+  it("falls back to 'message' field when 'error' is missing", () => {
+    const msg = formatAgentError(
+      makeEvent({ payload: { agentName: "Bot", message: "OOM killed" } }),
+    );
+    const fields = msg.embeds?.[0]?.fields ?? [];
+    expect(fields[0]?.value).toContain("OOM killed");
+  });
+
+  it("falls back to entityId for agent name when payload is empty", () => {
+    const msg = formatAgentError(makeEvent({ entityId: "agent-x" }));
+    expect(msg.embeds?.[0]?.description).toContain("agent-x");
+  });
+});
+
+describe("formatAgentRunStarted", () => {
+  it("formats run started with blue color", () => {
+    const msg = formatAgentRunStarted(
+      makeEvent({ payload: { agentName: "BD Agent" } }),
+    );
+    expect(msg.embeds?.[0]?.color).toBe(COLORS.BLUE);
+    expect(msg.embeds?.[0]?.title).toBe("Agent Run Started");
+    expect(msg.embeds?.[0]?.description).toContain("BD Agent");
+  });
+
+  it("falls back to entityId when agentName missing", () => {
+    const msg = formatAgentRunStarted(makeEvent({ entityId: "fallback-agent" }));
+    expect(msg.embeds?.[0]?.description).toContain("fallback-agent");
+  });
+});
+
+describe("formatAgentRunFinished", () => {
+  it("formats run finished with green color", () => {
+    const msg = formatAgentRunFinished(
+      makeEvent({ payload: { agentName: "BD Agent" } }),
+    );
+    expect(msg.embeds?.[0]?.color).toBe(COLORS.GREEN);
+    expect(msg.embeds?.[0]?.title).toBe("Agent Run Finished");
+    expect(msg.embeds?.[0]?.description).toContain("completed successfully");
+  });
+});
+
+describe("embed color selection", () => {
+  it("BLUE for issue created", () => {
+    const msg = formatIssueCreated(makeEvent());
+    expect(msg.embeds?.[0]?.color).toBe(COLORS.BLUE);
+  });
+
+  it("GREEN for issue done", () => {
+    const msg = formatIssueDone(makeEvent());
+    expect(msg.embeds?.[0]?.color).toBe(COLORS.GREEN);
+  });
+
+  it("YELLOW for approval created", () => {
+    const msg = formatApprovalCreated(makeEvent());
+    expect(msg.embeds?.[0]?.color).toBe(COLORS.YELLOW);
+  });
+
+  it("RED for agent error", () => {
+    const msg = formatAgentError(makeEvent({ payload: { error: "e" } }));
+    expect(msg.embeds?.[0]?.color).toBe(COLORS.RED);
+  });
+});
+
+describe("agent label formatting", () => {
+  it("includes agent name in approval embed fields", () => {
+    const msg = formatApprovalCreated(
+      makeEvent({ payload: { agentName: "DeployBot", type: "deploy" } }),
+    );
+    const fields = msg.embeds?.[0]?.fields ?? [];
+    const agentField = fields.find((f) => f.name === "Agent");
+    expect(agentField?.value).toBe("DeployBot");
+  });
+});
+
+describe("escalation embed structure", () => {
+  it("approval created embed has action row with 3 buttons", () => {
+    const msg = formatApprovalCreated(
+      makeEvent({ payload: { approvalId: "apr-1" } }),
+    );
+    expect(msg.components).toHaveLength(1);
+    expect(msg.components?.[0]?.type).toBe(1); // action row
+    expect(msg.components?.[0]?.components).toHaveLength(3);
+  });
+
+  it("approve button uses style 3 (success/green)", () => {
+    const msg = formatApprovalCreated(
+      makeEvent({ payload: { approvalId: "apr-1" } }),
+    );
+    const approveBtn = msg.components?.[0]?.components?.[0];
+    expect(approveBtn?.style).toBe(3);
+    expect(approveBtn?.label).toBe("Approve");
+  });
+
+  it("reject button uses style 4 (danger/red)", () => {
+    const msg = formatApprovalCreated(
+      makeEvent({ payload: { approvalId: "apr-1" } }),
+    );
+    const rejectBtn = msg.components?.[0]?.components?.[1];
+    expect(rejectBtn?.style).toBe(4);
+    expect(rejectBtn?.label).toBe("Reject");
+  });
+
+  it("view button uses style 5 (link)", () => {
+    const msg = formatApprovalCreated(
+      makeEvent({ payload: { approvalId: "apr-1" } }),
+    );
+    const viewBtn = msg.components?.[0]?.components?.[2];
+    expect(viewBtn?.style).toBe(5);
+    expect(viewBtn?.url).toBeDefined();
   });
 });
