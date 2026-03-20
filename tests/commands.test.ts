@@ -12,30 +12,48 @@ function makeCtx(overrides: Record<string, unknown> = {}) {
     },
     agents: {
       list: vi.fn().mockResolvedValue([]),
+      sessions: {
+        create: vi.fn(),
+        sendMessage: vi.fn(),
+        close: vi.fn(),
+      },
+      invoke: vi.fn(),
     },
     issues: {
       list: vi.fn().mockResolvedValue([]),
     },
     state: {
       get: vi.fn().mockResolvedValue(null),
+      set: vi.fn().mockResolvedValue(undefined),
     },
     http: {
       fetch: vi.fn().mockResolvedValue({ ok: true }),
+    },
+    events: {
+      emit: vi.fn(),
+      on: vi.fn(),
     },
     ...overrides,
   } as any;
 }
 
+const defaultCmdCtx: CommandContext = {
+  baseUrl: "http://localhost:3100",
+  companyId: "default",
+  token: "test-token",
+  defaultChannelId: "ch-1",
+};
+
 describe("handleInteraction", () => {
   it("responds to PING with PONG", async () => {
     const ctx = makeCtx();
-    const result = await handleInteraction(ctx, { type: 1 }, { baseUrl: "http://localhost:3100", companyId: "default" });
+    const result = await handleInteraction(ctx, { type: 1 }, defaultCmdCtx);
     expect(result).toEqual({ type: 1 });
   });
 
   it("handles unknown interaction type", async () => {
     const ctx = makeCtx();
-    const result = await handleInteraction(ctx, { type: 99 }, { baseUrl: "http://localhost:3100", companyId: "default" }) as any;
+    const result = await handleInteraction(ctx, { type: 99 }, defaultCmdCtx) as any;
     expect(result.type).toBe(4);
     expect(result.data.content).toContain("Unknown interaction type");
   });
@@ -45,7 +63,7 @@ describe("handleInteraction", () => {
     await handleInteraction(
       ctx,
       { type: 2, data: { name: "clip", options: [{ name: "status" }] } },
-      { baseUrl: "http://localhost:3100", companyId: "default" },
+      defaultCmdCtx,
     );
     expect(ctx.metrics.write).toHaveBeenCalledWith("discord_commands_handled", 1);
   });
@@ -58,6 +76,8 @@ describe("/clip status", () => {
         list: vi.fn().mockResolvedValue([
           { id: "a1", name: "BD Agent" },
         ]),
+        sessions: { create: vi.fn(), sendMessage: vi.fn(), close: vi.fn() },
+        invoke: vi.fn(),
       },
       issues: {
         list: vi.fn().mockResolvedValue([
@@ -69,7 +89,7 @@ describe("/clip status", () => {
     const result = await handleInteraction(
       ctx,
       { type: 2, data: { name: "clip", options: [{ name: "status" }] } },
-      { baseUrl: "http://localhost:3100", companyId: "default" },
+      defaultCmdCtx,
     ) as any;
 
     expect(result.type).toBe(4);
@@ -85,7 +105,7 @@ describe("/clip status", () => {
     const result = await handleInteraction(
       ctx,
       { type: 2, data: { name: "clip", options: [{ name: "status" }] } },
-      { baseUrl: "http://localhost:3100", companyId: "default" },
+      defaultCmdCtx,
     ) as any;
 
     const embed = result.data.embeds[0];
@@ -100,7 +120,7 @@ describe("/clip approve", () => {
     const result = await handleInteraction(
       ctx,
       { type: 2, data: { name: "clip", options: [{ name: "approve", options: [] }] } },
-      { baseUrl: "http://localhost:3100", companyId: "default" },
+      defaultCmdCtx,
     ) as any;
 
     expect(result.data.content).toContain("Missing approval ID");
@@ -108,6 +128,7 @@ describe("/clip approve", () => {
 
   it("calls approval API with correct URL", async () => {
     const ctx = makeCtx();
+    const cmdCtx = { ...defaultCmdCtx, baseUrl: "https://app.example.com" };
     const result = await handleInteraction(
       ctx,
       {
@@ -115,7 +136,7 @@ describe("/clip approve", () => {
         data: { name: "clip", options: [{ name: "approve", options: [{ name: "id", value: "apr-1" }] }] },
         member: { user: { username: "testuser" } },
       },
-      { baseUrl: "https://app.example.com", companyId: "default" },
+      cmdCtx,
     ) as any;
 
     expect(ctx.http.fetch).toHaveBeenCalledWith(
@@ -132,7 +153,7 @@ describe("/clip budget", () => {
     const result = await handleInteraction(
       ctx,
       { type: 2, data: { name: "clip", options: [{ name: "budget", options: [] }] } },
-      { baseUrl: "http://localhost:3100", companyId: "default" },
+      defaultCmdCtx,
     ) as any;
 
     expect(result.data.content).toContain("Missing agent name");
@@ -144,16 +165,19 @@ describe("/clip budget", () => {
         list: vi.fn().mockResolvedValue([
           { id: "a1", name: "BD Agent" },
         ]),
+        sessions: { create: vi.fn(), sendMessage: vi.fn(), close: vi.fn() },
+        invoke: vi.fn(),
       },
       state: {
         get: vi.fn().mockResolvedValue({ spent: 15.5, limit: 100 }),
+        set: vi.fn().mockResolvedValue(undefined),
       },
     });
 
     const result = await handleInteraction(
       ctx,
       { type: 2, data: { name: "clip", options: [{ name: "budget", options: [{ name: "agent", value: "BD Agent" }] }] } },
-      { baseUrl: "http://localhost:3100", companyId: "default" },
+      defaultCmdCtx,
     ) as any;
 
     const embed = result.data.embeds[0];
@@ -168,7 +192,7 @@ describe("/clip budget", () => {
     const result = await handleInteraction(
       ctx,
       { type: 2, data: { name: "clip", options: [{ name: "budget", options: [{ name: "agent", value: "unknown" }] }] } },
-      { baseUrl: "http://localhost:3100", companyId: "default" },
+      defaultCmdCtx,
     ) as any;
 
     expect(result.data.content).toContain("Agent not found");
@@ -178,6 +202,7 @@ describe("/clip budget", () => {
 describe("button clicks", () => {
   it("handles approve button click", async () => {
     const ctx = makeCtx();
+    const cmdCtx = { ...defaultCmdCtx, baseUrl: "https://app.example.com" };
     const result = await handleInteraction(
       ctx,
       {
@@ -185,7 +210,7 @@ describe("button clicks", () => {
         data: { name: "button", custom_id: "approval_approve_apr-1" },
         member: { user: { username: "clicker" } },
       },
-      { baseUrl: "https://app.example.com", companyId: "default" },
+      cmdCtx,
     ) as any;
 
     expect(ctx.http.fetch).toHaveBeenCalledWith(
@@ -198,6 +223,7 @@ describe("button clicks", () => {
 
   it("handles reject button click", async () => {
     const ctx = makeCtx();
+    const cmdCtx = { ...defaultCmdCtx, baseUrl: "https://app.example.com" };
     const result = await handleInteraction(
       ctx,
       {
@@ -205,7 +231,7 @@ describe("button clicks", () => {
         data: { name: "button", custom_id: "approval_reject_apr-2" },
         member: { user: { username: "clicker" } },
       },
-      { baseUrl: "https://app.example.com", companyId: "default" },
+      cmdCtx,
     ) as any;
 
     expect(ctx.http.fetch).toHaveBeenCalledWith(
@@ -218,11 +244,14 @@ describe("button clicks", () => {
 });
 
 describe("SLASH_COMMANDS", () => {
-  it("defines clip command with status, approve, and budget subcommands", () => {
-    expect(SLASH_COMMANDS).toHaveLength(1);
+  it("defines clip and acp commands", () => {
+    expect(SLASH_COMMANDS).toHaveLength(2);
     const clip = SLASH_COMMANDS[0]!;
     expect(clip.name).toBe("clip");
     const subNames = clip.options.map((o) => o.name);
     expect(subNames).toEqual(["status", "approve", "budget"]);
+
+    const acp = SLASH_COMMANDS[1]!;
+    expect(acp.name).toBe("acp");
   });
 });

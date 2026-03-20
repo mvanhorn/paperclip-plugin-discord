@@ -2,7 +2,7 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { type DiscordEmbed, respondToInteraction } from "./discord-api.js";
 import { COLORS, METRIC_NAMES } from "./constants.js";
 import { withRetry } from "./retry.js";
-import { handleAcpCommand } from "./acp-bridge.js";
+import { handleHandoffButton, handleDiscussionButton, handleAcpCommand } from "./session-registry.js";
 
 interface InteractionOption {
   name: string;
@@ -26,6 +26,8 @@ interface Interaction {
 export interface CommandContext {
   baseUrl: string;
   companyId: string;
+  token: string;
+  defaultChannelId: string;
 }
 
 function getOption(
@@ -45,7 +47,7 @@ export const SLASH_COMMANDS = [
       {
         name: "status",
         description: "Show active agents and recent task completions",
-        type: 1, // SUB_COMMAND
+        type: 1,
       },
       {
         name: "approve",
@@ -55,7 +57,7 @@ export const SLASH_COMMANDS = [
           {
             name: "id",
             description: "The approval ID",
-            type: 3, // STRING
+            type: 3,
             required: true,
           },
         ],
@@ -82,12 +84,12 @@ export const SLASH_COMMANDS = [
       {
         name: "spawn",
         description: "Start a new coding agent session in a thread",
-        type: 1, // SUB_COMMAND
+        type: 1,
         options: [
           {
             name: "agent",
             description: "Agent name to spawn",
-            type: 3, // STRING
+            type: 3,
             required: true,
           },
           {
@@ -147,7 +149,7 @@ export async function handleInteraction(
   cmdCtx: CommandContext,
 ): Promise<unknown> {
   if (interaction.type === 1) {
-    return { type: 1 }; // PONG
+    return { type: 1 };
   }
 
   if (interaction.type === 2 && interaction.data) {
@@ -172,11 +174,15 @@ async function handleSlashCommand(
   member?: { user: { username: string } },
   cmdCtx?: CommandContext,
 ): Promise<unknown> {
-  // Route /acp commands to the ACP bridge
   if (data.name === "acp") {
-    return handleAcpCommand(ctx, data);
+    return handleAcpCommand(
+      ctx,
+      cmdCtx?.token ?? "",
+      data,
+      cmdCtx?.companyId ?? "default",
+      cmdCtx?.defaultChannelId ?? "",
+    );
   }
-
 
   const subcommand = data.options?.[0];
   if (!subcommand) {
@@ -218,11 +224,11 @@ async function handleStatus(ctx: PluginContext, companyId: string): Promise<unkn
     const issues = await ctx.issues.list({ companyId, status: "done", limit: 5 });
 
     const agentList = agents.length > 0
-      ? agents.map((a) => `- **${a.name ?? a.id}**`).join("\n")
+      ? agents.map((a: { name?: string; id: string }) => `- **${a.name ?? a.id}**`).join("\n")
       : "No active agents";
 
     const issueList = issues.length > 0
-      ? issues.map((i) => `- **${i.identifier ?? i.id}** ${i.title ?? ""}`).join("\n")
+      ? issues.map((i: { identifier?: string; id: string; title?: string }) => `- **${i.identifier ?? i.id}** ${i.title ?? ""}`).join("\n")
       : "No recent completions";
 
     const embeds: DiscordEmbed[] = [
@@ -238,11 +244,7 @@ async function handleStatus(ctx: PluginContext, companyId: string): Promise<unkn
       },
     ];
 
-    return respondToInteraction({
-      type: 4,
-      embeds,
-      ephemeral: true,
-    });
+    return respondToInteraction({ type: 4, embeds, ephemeral: true });
   } catch (error) {
     return respondToInteraction({
       type: 4,
@@ -288,7 +290,6 @@ async function handleApprove(
         footer: { text: "Paperclip" },
         timestamp: new Date().toISOString(),
       }],
-      ephemeral: false,
     });
   } catch (error) {
     return respondToInteraction({
@@ -315,7 +316,7 @@ async function handleBudget(
   try {
     const agents = await ctx.agents.list({ companyId });
     const agent = agents.find(
-      (a) =>
+      (a: { id: string; name: string }) =>
         a.id === agentQuery || a.name === agentQuery ||
         a.name.toLowerCase() === agentQuery.toLowerCase(),
     );
@@ -328,10 +329,9 @@ async function handleBudget(
       });
     }
 
-    const agentId = agent.id;
     const budgetState = await ctx.state.get({
       scopeKind: "agent",
-      scopeId: agentId,
+      scopeId: agent.id,
       stateKey: "budget",
     }) as { spent?: number; limit?: number } | null;
 
@@ -344,7 +344,7 @@ async function handleBudget(
       type: 4,
       embeds: [
         {
-          title: `Budget: ${agent.name ?? agentId}`,
+          title: `Budget: ${agent.name ?? agent.id}`,
           color: remaining > 0 ? COLORS.GREEN : COLORS.RED,
           fields: [
             { name: "Spent", value: `$${spent.toFixed(2)}`, inline: true },
@@ -375,6 +375,7 @@ async function handleButtonClick(
   const customId = data.custom_id ?? data.name;
   const actor = username ?? "Discord user";
   const base = cmdCtx?.baseUrl ?? "http://localhost:3100";
+  const token = cmdCtx?.token ?? "";
 
   if (customId.startsWith("approval_approve_")) {
     const approvalId = customId.replace("approval_approve_", "");
@@ -382,14 +383,11 @@ async function handleButtonClick(
 
     try {
       await withRetry(() =>
-        ctx.http.fetch(
-          `${base}/api/approvals/${approvalId}/approve`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ decidedByUserId: `discord:${actor}` }),
-          },
-        ),
+        ctx.http.fetch(`${base}/api/approvals/${approvalId}/approve`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decidedByUserId: `discord:${actor}` }),
+        }),
       );
       await ctx.metrics.write(METRIC_NAMES.approvalsDecided, 1);
     } catch (err) {
@@ -411,24 +409,17 @@ async function handleButtonClick(
     };
   }
 
-  if (customId.startsWith("esc_")) {
-    return handleEscalationButton(ctx, customId, actor, base);
-  }
-
   if (customId.startsWith("approval_reject_")) {
     const approvalId = customId.replace("approval_reject_", "");
     ctx.logger.info("Rejection button clicked", { approvalId, action: "reject", actor });
 
     try {
       await withRetry(() =>
-        ctx.http.fetch(
-          `${base}/api/approvals/${approvalId}/reject`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ decidedByUserId: `discord:${actor}` }),
-          },
-        ),
+        ctx.http.fetch(`${base}/api/approvals/${approvalId}/reject`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decidedByUserId: `discord:${actor}` }),
+        }),
       );
       await ctx.metrics.write(METRIC_NAMES.approvalsDecided, 1);
     } catch (err) {
@@ -450,6 +441,18 @@ async function handleButtonClick(
     };
   }
 
+  if (customId.startsWith("esc_")) {
+    return handleEscalationButton(ctx, customId, actor, base);
+  }
+
+  if (customId.startsWith("handoff_")) {
+    return handleHandoffButton(ctx, token, customId, actor);
+  }
+
+  if (customId.startsWith("disc_")) {
+    return handleDiscussionButton(ctx, token, customId, actor);
+  }
+
   return respondToInteraction({
     type: 4,
     content: "Unknown button action.",
@@ -461,9 +464,8 @@ async function handleEscalationButton(
   ctx: PluginContext,
   customId: string,
   actor: string,
-  baseUrl: string,
+  _baseUrl: string,
 ): Promise<unknown> {
-  // Parse: esc_{action}_{escalationId}
   const parts = customId.split("_");
   const action = parts[1];
   const escalationId = parts.slice(2).join("_");
@@ -476,6 +478,7 @@ async function handleEscalationButton(
     stateKey: `escalation_${escalationId}`,
   }) as {
     escalationId: string;
+    companyId: string;
     agentName: string;
     reason: string;
     suggestedReply?: string;
@@ -483,38 +486,38 @@ async function handleEscalationButton(
   } | null;
 
   if (!record) {
-    return respondToInteraction({
-      type: 4,
-      content: `Escalation \`${escalationId}\` not found.`,
-      ephemeral: true,
-    });
+    return respondToInteraction({ type: 4, content: `Escalation \`${escalationId}\` not found.`, ephemeral: true });
   }
 
   if (record.status !== "pending") {
-    return respondToInteraction({
-      type: 4,
-      content: `Escalation \`${escalationId}\` has already been ${record.status}.`,
-      ephemeral: true,
-    });
+    return respondToInteraction({ type: 4, content: `Escalation already ${record.status}.`, ephemeral: true });
   }
+
+  const companyId = record.companyId || "default";
+
+  const resolveRecord = async (resolution: string): Promise<void> => {
+    record.status = "resolved";
+    await ctx.state.set(
+      { scopeKind: "company", scopeId: "default", stateKey: `escalation_${escalationId}` },
+      {
+        ...record,
+        resolvedAt: new Date().toISOString(),
+        resolvedBy: `discord:${actor}`,
+        resolution,
+      },
+    );
+    await ctx.metrics.write(METRIC_NAMES.escalationsResolved, 1);
+    ctx.events.emit("escalation-resolved", companyId, {
+      escalationId,
+      action: resolution,
+      resolvedBy: actor,
+      suggestedReply: record.suggestedReply,
+    });
+  };
 
   switch (action) {
     case "suggest": {
-      // Use Suggested Reply - resolve with the suggested text
-      record.status = "resolved";
-      await ctx.state.set(
-        { scopeKind: "company", scopeId: "default", stateKey: `escalation_${escalationId}` },
-        { ...record, resolvedAt: new Date().toISOString(), resolvedBy: `discord:${actor}`, resolution: "suggested_reply" },
-      );
-      await ctx.metrics.write(METRIC_NAMES.approvalsDecided, 1);
-
-      ctx.events.emit("escalation.resolved", {
-        escalationId,
-        action: "suggested_reply",
-        resolvedBy: actor,
-        suggestedReply: record.suggestedReply,
-      });
-
+      await resolveRecord("suggested_reply");
       return {
         type: 7,
         data: {
@@ -535,20 +538,7 @@ async function handleEscalationButton(
     }
 
     case "reply": {
-      // Reply to Customer - acknowledge, the human will type a follow-up
-      record.status = "resolved";
-      await ctx.state.set(
-        { scopeKind: "company", scopeId: "default", stateKey: `escalation_${escalationId}` },
-        { ...record, resolvedAt: new Date().toISOString(), resolvedBy: `discord:${actor}`, resolution: "human_reply" },
-      );
-      await ctx.metrics.write(METRIC_NAMES.approvalsDecided, 1);
-
-      ctx.events.emit("escalation.resolved", {
-        escalationId,
-        action: "human_reply",
-        resolvedBy: actor,
-      });
-
+      await resolveRecord("human_reply");
       return {
         type: 7,
         data: {
@@ -556,9 +546,7 @@ async function handleEscalationButton(
             title: `Escalation from ${record.agentName} - RESOLVED`,
             description: `**${actor}** is replying to the customer directly.`,
             color: COLORS.GREEN,
-            fields: [
-              { name: "Reason", value: record.reason.slice(0, 1024) },
-            ],
+            fields: [{ name: "Reason", value: record.reason.slice(0, 1024) }],
             footer: { text: "Paperclip Escalation" },
             timestamp: new Date().toISOString(),
           }],
@@ -568,30 +556,15 @@ async function handleEscalationButton(
     }
 
     case "override": {
-      // Override Agent - human takes over
-      record.status = "resolved";
-      await ctx.state.set(
-        { scopeKind: "company", scopeId: "default", stateKey: `escalation_${escalationId}` },
-        { ...record, resolvedAt: new Date().toISOString(), resolvedBy: `discord:${actor}`, resolution: "agent_override" },
-      );
-      await ctx.metrics.write(METRIC_NAMES.approvalsDecided, 1);
-
-      ctx.events.emit("escalation.resolved", {
-        escalationId,
-        action: "agent_override",
-        resolvedBy: actor,
-      });
-
+      await resolveRecord("agent_override");
       return {
         type: 7,
         data: {
           embeds: [{
             title: `Escalation from ${record.agentName} - OVERRIDDEN`,
-            description: `**${actor}** has overridden the agent and taken control.`,
+            description: `**${actor}** has overridden the agent.`,
             color: COLORS.GREEN,
-            fields: [
-              { name: "Reason", value: record.reason.slice(0, 1024) },
-            ],
+            fields: [{ name: "Reason", value: record.reason.slice(0, 1024) }],
             footer: { text: "Paperclip Escalation" },
             timestamp: new Date().toISOString(),
           }],
@@ -601,20 +574,7 @@ async function handleEscalationButton(
     }
 
     case "dismiss": {
-      // Dismiss - close without action
-      record.status = "resolved";
-      await ctx.state.set(
-        { scopeKind: "company", scopeId: "default", stateKey: `escalation_${escalationId}` },
-        { ...record, resolvedAt: new Date().toISOString(), resolvedBy: `discord:${actor}`, resolution: "dismissed" },
-      );
-      await ctx.metrics.write(METRIC_NAMES.approvalsDecided, 1);
-
-      ctx.events.emit("escalation.resolved", {
-        escalationId,
-        action: "dismissed",
-        resolvedBy: actor,
-      });
-
+      await resolveRecord("dismissed");
       return {
         type: 7,
         data: {
@@ -622,9 +582,7 @@ async function handleEscalationButton(
             title: `Escalation from ${record.agentName} - DISMISSED`,
             description: `Dismissed by ${actor}`,
             color: COLORS.GRAY,
-            fields: [
-              { name: "Reason", value: record.reason.slice(0, 1024) },
-            ],
+            fields: [{ name: "Reason", value: record.reason.slice(0, 1024) }],
             footer: { text: "Paperclip Escalation" },
             timestamp: new Date().toISOString(),
           }],
@@ -634,10 +592,6 @@ async function handleEscalationButton(
     }
 
     default:
-      return respondToInteraction({
-        type: 4,
-        content: `Unknown escalation action: ${action}`,
-        ephemeral: true,
-      });
+      return respondToInteraction({ type: 4, content: `Unknown escalation action: ${action}`, ephemeral: true });
   }
 }
