@@ -1046,3 +1046,193 @@ describe("SLASH_COMMANDS", () => {
     expect(projectOpt?.autocomplete).toBe(true);
   });
 });
+
+describe("issue_reopen button", () => {
+  it("calls PATCH to reopen the issue and returns type 7 success", async () => {
+    mockPaperclipFetch.mockResolvedValue({ ok: true, status: 200, headers: new Headers(), text: () => Promise.resolve("") });
+    const ctx = makeCtx();
+    const cmdCtx = { ...defaultCmdCtx, baseUrl: "https://app.example.com" };
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "issue_reopen_iss-42" },
+        member: { user: { username: "reviewer" } },
+      },
+      cmdCtx,
+    ) as any;
+
+    expect(mockPaperclipFetch).toHaveBeenCalledWith(
+      "https://app.example.com/api/issues/iss-42",
+      expect.objectContaining({ method: "PATCH" }),
+    );
+    expect(result.type).toBe(7);
+    expect(result.data.embeds[0].title).toBe("Issue Reopened");
+    expect(result.data.embeds[0].description).toContain("reviewer");
+    expect(result.data.embeds[0].color).toBe(COLORS.YELLOW);
+    expect(result.data.components).toEqual([]);
+  });
+
+  it("returns error embed when API fails", async () => {
+    mockPaperclipFetch.mockResolvedValue({ ok: false, status: 422, headers: new Headers(), text: () => Promise.resolve("Unprocessable Entity") });
+    const ctx = makeCtx();
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "issue_reopen_iss-fail" },
+        member: { user: { username: "reviewer" } },
+      },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(result.type).toBe(7);
+    expect(result.data.embeds[0].title).toBe("Reopen Failed");
+    expect(result.data.embeds[0].color).toBe(COLORS.RED);
+    expect(result.data.components).toEqual([]);
+  });
+
+  it("sets status to todo in the PATCH body", async () => {
+    mockPaperclipFetch.mockResolvedValue({ ok: true, status: 200, headers: new Headers(), text: () => Promise.resolve("") });
+    const ctx = makeCtx();
+    await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "issue_reopen_iss-99" },
+        member: { user: { username: "user1" } },
+      },
+      defaultCmdCtx,
+    );
+
+    const body = JSON.parse(mockPaperclipFetch.mock.calls[0][1].body);
+    expect(body.status).toBe("todo");
+    expect(body.comment).toContain("user1");
+  });
+});
+
+describe("issue_assign button", () => {
+  it("calls PATCH to assign and returns ephemeral success", async () => {
+    mockPaperclipFetch.mockResolvedValue({ ok: true, status: 200, headers: new Headers(), text: () => Promise.resolve("") });
+    const ctx = makeCtx();
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "issue_assign_iss-55" },
+        member: { user: { username: "assignee" } },
+      },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(mockPaperclipFetch).toHaveBeenCalledWith(
+      "http://localhost:3100/api/issues/iss-55",
+      expect.objectContaining({ method: "PATCH" }),
+    );
+    expect(result.type).toBe(4);
+    expect(result.data.content).toContain("assignee");
+    expect(result.data.flags).toBe(64); // ephemeral
+  });
+
+  it("returns ephemeral error when API fails", async () => {
+    mockPaperclipFetch.mockResolvedValue({ ok: false, status: 403, headers: new Headers(), text: () => Promise.resolve("Forbidden") });
+    const ctx = makeCtx();
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "issue_assign_iss-denied" },
+        member: { user: { username: "assignee" } },
+      },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(result.type).toBe(4);
+    expect(result.data.content).toContain("Could not assign");
+    expect(result.data.flags).toBe(64);
+  });
+
+  it("sends assigneeUserId with discord prefix in body", async () => {
+    mockPaperclipFetch.mockResolvedValue({ ok: true, status: 200, headers: new Headers(), text: () => Promise.resolve("") });
+    const ctx = makeCtx();
+    await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "issue_assign_iss-77" },
+        member: { user: { username: "bob" } },
+      },
+      defaultCmdCtx,
+    );
+
+    const body = JSON.parse(mockPaperclipFetch.mock.calls[0][1].body);
+    expect(body.assigneeUserId).toBe("discord:bob");
+  });
+});
+
+describe("digest_blocked button", () => {
+  it("returns ephemeral list of blocked issues", async () => {
+    const ctx = makeCtx({
+      issues: {
+        list: vi.fn().mockResolvedValue([
+          { id: "i1", identifier: "X-1", title: "Stuck task" },
+          { id: "i2", identifier: "X-2", title: "Also blocked", blockerReason: "Waiting on deploy" },
+        ]),
+      },
+    });
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "digest_blocked_comp-1" },
+        member: { user: { username: "viewer" } },
+      },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(result.type).toBe(4);
+    expect(result.data.flags).toBe(64);
+    expect(result.data.content).toContain("X-1");
+    expect(result.data.content).toContain("X-2");
+    expect(result.data.content).toContain("Waiting on deploy");
+  });
+
+  it("returns message when no blocked issues", async () => {
+    const ctx = makeCtx({
+      issues: {
+        list: vi.fn().mockResolvedValue([]),
+      },
+    });
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "digest_blocked_comp-2" },
+        member: { user: { username: "viewer" } },
+      },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(result.type).toBe(4);
+    expect(result.data.content).toContain("No blocked issues");
+    expect(result.data.flags).toBe(64);
+  });
+
+  it("passes companyId and blocked status filter to issues.list", async () => {
+    const listMock = vi.fn().mockResolvedValue([]);
+    const ctx = makeCtx({ issues: { list: listMock } });
+    await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "digest_blocked_my-company" },
+        member: { user: { username: "viewer" } },
+      },
+      defaultCmdCtx,
+    );
+
+    expect(listMock).toHaveBeenCalledWith(
+      expect.objectContaining({ companyId: "my-company", status: "blocked" }),
+    );
+  });
+});

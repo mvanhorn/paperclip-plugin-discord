@@ -43,9 +43,8 @@ describe("formatIssueCreated", () => {
       makeEvent({ payload: { assigneeName: "Agent Smith" } }),
     );
     const fields = msg.embeds?.[0]?.fields ?? [];
-    expect(fields).toHaveLength(1);
-    expect(fields[0]?.name).toBe("Assignee");
-    expect(fields[0]?.value).toBe("Agent Smith");
+    const assigneeField = fields.find((f) => f.name === "Assignee");
+    expect(assigneeField?.value).toBe("Agent Smith");
   });
 
   it("uses configurable base URL for dashboard link", () => {
@@ -53,14 +52,14 @@ describe("formatIssueCreated", () => {
       makeEvent({ entityId: "iss-1" }),
       "https://app.paperclip.dev",
     );
-    const link = msg.components?.[0]?.components?.[0];
-    expect(link?.url).toBe("https://app.paperclip.dev/issues/iss-1");
+    const viewBtn = msg.components?.[0]?.components?.find((c) => c.label === "View Issue");
+    expect(viewBtn?.url).toBe("https://app.paperclip.dev/issues/iss-1");
   });
 
   it("uses default base URL when none provided", () => {
     const msg = formatIssueCreated(makeEvent({ entityId: "iss-1" }));
-    const link = msg.components?.[0]?.components?.[0];
-    expect(link?.url).toBe("http://localhost:3100/issues/iss-1");
+    const viewBtn = msg.components?.[0]?.components?.find((c) => c.label === "View Issue");
+    expect(viewBtn?.url).toBe("http://localhost:3100/issues/iss-1");
   });
 });
 
@@ -352,7 +351,7 @@ describe("approval View button URL uses configured base URL", () => {
       makeEvent({ entityId: "issue-42" }),
       "https://app.paperclip.ing",
     );
-    const viewBtn = msg.components?.[0]?.components?.[0];
+    const viewBtn = msg.components?.[0]?.components?.find((c) => c.label === "View Issue");
     expect(viewBtn?.url).toBe("https://app.paperclip.ing/issues/issue-42");
   });
 });
@@ -407,5 +406,153 @@ describe("humanized status and priority in issue embeds", () => {
     const priorityField = fields.find((f) => f.name === "Priority");
     expect(statusField?.value).toBe("`Done`");
     expect(priorityField?.value).toBe("`Low`");
+  });
+});
+
+describe("formatIssueCreated — actionability improvements", () => {
+  it("includes Assign to Me button with correct custom_id", () => {
+    const msg = formatIssueCreated(
+      makeEvent({ entityId: "iss-99", payload: { identifier: "X-1", title: "Task" } }),
+    );
+    const assignBtn = msg.components?.[0]?.components?.find((c) => c.label === "Assign to Me");
+    expect(assignBtn).toBeDefined();
+    expect(assignBtn?.style).toBe(1); // blurple/primary
+    expect(assignBtn?.custom_id).toBe("issue_assign_iss-99");
+  });
+
+  it("shows parent context field when parentIdentifier is provided", () => {
+    const msg = formatIssueCreated(
+      makeEvent({ payload: { identifier: "X-2", title: "Sub", parentIdentifier: "X-1", parentTitle: "Parent Task" } }),
+    );
+    const parentField = msg.embeds?.[0]?.fields?.find((f) => f.name === "Parent");
+    expect(parentField).toBeDefined();
+    expect(parentField?.value).toContain("X-1");
+    expect(parentField?.value).toContain("Parent Task");
+  });
+
+  it("shows View Parent button when parentId is provided", () => {
+    const msg = formatIssueCreated(
+      makeEvent({ entityId: "iss-2", payload: { identifier: "X-2", title: "Sub", parentId: "parent-id-1", parentIdentifier: "X-1" } }),
+      "https://app.test.com",
+    );
+    const parentBtn = msg.components?.[0]?.components?.find((c) => c.label === "View Parent");
+    expect(parentBtn).toBeDefined();
+    expect(parentBtn?.url).toBe("https://app.test.com/issues/parent-id-1");
+  });
+
+  it("does not show View Parent button when no parentId", () => {
+    const msg = formatIssueCreated(
+      makeEvent({ entityId: "iss-3", payload: { identifier: "X-3", title: "No parent" } }),
+    );
+    const parentBtn = msg.components?.[0]?.components?.find((c) => c.label === "View Parent");
+    expect(parentBtn).toBeUndefined();
+  });
+
+  it("shows enhanced footer with creator and project", () => {
+    const msg = formatIssueCreated(
+      makeEvent({ payload: { identifier: "X-4", title: "T", creatorName: "CEO", projectName: "Alpha" } }),
+    );
+    expect(msg.embeds?.[0]?.footer?.text).toBe("Created by CEO • Alpha");
+  });
+
+  it("uses description blockquote with 500 char limit", () => {
+    const longDesc = "a".repeat(600);
+    const msg = formatIssueCreated(
+      makeEvent({ payload: { identifier: "X-5", title: "T", description: longDesc } }),
+    );
+    const desc = msg.embeds?.[0]?.description ?? "";
+    // The blockquoted description should be truncated to 500 chars
+    expect(desc).toContain("> ");
+    expect(desc.length).toBeLessThan(510 + "**T**\n> ".length);
+  });
+
+  it("does not include parentIdentifier/parentTitle/parentId/creatorName as dynamic fields", () => {
+    const msg = formatIssueCreated(
+      makeEvent({ payload: {
+        identifier: "X-6", title: "T",
+        parentIdentifier: "X-5", parentTitle: "P", parentId: "pid", creatorName: "Bob",
+      } }),
+    );
+    const fields = msg.embeds?.[0]?.fields ?? [];
+    const dynamicNames = fields.map((f) => f.name);
+    expect(dynamicNames).not.toContain("parentIdentifier");
+    expect(dynamicNames).not.toContain("parentTitle");
+    expect(dynamicNames).not.toContain("parentId");
+    expect(dynamicNames).not.toContain("creatorName");
+  });
+});
+
+describe("formatIssueDone — actionability improvements", () => {
+  it("shows checkmark emoji in title", () => {
+    const msg = formatIssueDone(
+      makeEvent({ payload: { identifier: "PROJ-10", title: "Done task" } }),
+    );
+    expect(msg.embeds?.[0]?.title).toContain("✅");
+    expect(msg.embeds?.[0]?.title).toContain("PROJ-10");
+  });
+
+  it("includes Completed by field when assigneeName is provided", () => {
+    const msg = formatIssueDone(
+      makeEvent({ payload: { identifier: "X-1", title: "T", assigneeName: "Engineer" } }),
+    );
+    const field = msg.embeds?.[0]?.fields?.find((f) => f.name === "Completed by");
+    expect(field).toBeDefined();
+    expect(field?.value).toBe("Engineer");
+  });
+
+  it("includes Summary field from lastComment, truncated to 200 chars", () => {
+    const longComment = "x".repeat(300);
+    const msg = formatIssueDone(
+      makeEvent({ payload: { identifier: "X-2", title: "T", lastComment: longComment } }),
+    );
+    const field = msg.embeds?.[0]?.fields?.find((f) => f.name === "Summary");
+    expect(field).toBeDefined();
+    expect(field!.value.length).toBeLessThanOrEqual(200);
+  });
+
+  it("includes Parent field when parentIdentifier is provided", () => {
+    const msg = formatIssueDone(
+      makeEvent({ payload: { identifier: "X-3", title: "T", parentIdentifier: "X-1", parentTitle: "Parent" } }),
+    );
+    const field = msg.embeds?.[0]?.fields?.find((f) => f.name === "Parent");
+    expect(field).toBeDefined();
+    expect(field?.value).toContain("X-1");
+  });
+
+  it("includes Reopen button with correct custom_id and danger style", () => {
+    const msg = formatIssueDone(
+      makeEvent({ entityId: "iss-done", payload: { identifier: "X-4", title: "T" } }),
+    );
+    const reopenBtn = msg.components?.[0]?.components?.find((c) => c.label === "Reopen");
+    expect(reopenBtn).toBeDefined();
+    expect(reopenBtn?.style).toBe(4); // danger/red
+    expect(reopenBtn?.custom_id).toBe("issue_reopen_iss-done");
+  });
+
+  it("includes View Diff button when prUrl is provided", () => {
+    const msg = formatIssueDone(
+      makeEvent({ payload: { identifier: "X-5", title: "T", prUrl: "https://github.com/org/repo/pull/1" } }),
+    );
+    const diffBtn = msg.components?.[0]?.components?.find((c) => c.label === "View Diff");
+    expect(diffBtn).toBeDefined();
+    expect(diffBtn?.url).toBe("https://github.com/org/repo/pull/1");
+    expect(diffBtn?.style).toBe(5); // link
+  });
+
+  it("does not include View Diff button when no prUrl", () => {
+    const msg = formatIssueDone(
+      makeEvent({ payload: { identifier: "X-6", title: "T" } }),
+    );
+    const diffBtn = msg.components?.[0]?.components?.find((c) => c.label === "View Diff");
+    expect(diffBtn).toBeUndefined();
+  });
+
+  it("always includes View Issue button", () => {
+    const msg = formatIssueDone(
+      makeEvent({ entityId: "iss-7", payload: { identifier: "X-7", title: "T" } }),
+    );
+    const viewBtn = msg.components?.[0]?.components?.find((c) => c.label === "View Issue");
+    expect(viewBtn).toBeDefined();
+    expect(viewBtn?.url).toBe("http://localhost:3100/issues/iss-7");
   });
 });

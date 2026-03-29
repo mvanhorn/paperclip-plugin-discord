@@ -24,6 +24,7 @@ import {
   formatAgentError,
   formatAgentRunStarted,
   formatAgentRunFinished,
+  humanizePriority,
 } from "./formatters.js";
 import { handleInteraction, SLASH_COMMANDS, type CommandContext } from "./commands.js";
 import { runIntelligenceScan, runBackfill } from "./intelligence.js";
@@ -866,57 +867,94 @@ const plugin = definePlugin({
           const digestLabel = effectiveDigestMode === "bidaily" ? "Digest" : "Daily Digest";
           const companyLabel = company.name ? ` — ${company.name}` : "";
 
-          const fields: Array<{ name: string; value: string; inline?: boolean }> = [
-            { name: "✅ Tasks Completed", value: String(completedToday.length), inline: true },
-            { name: "📋 Tasks Created", value: String(createdToday.length), inline: true },
-            { name: "🤖 Active Agents", value: `${activeAgents.length}/${agents.length}`, inline: true },
-          ];
+            const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
 
-          if (activeAgents.length > 0) {
-            fields.push({
-              name: "⭐ Top Performer",
-              value: (activeAgents[0] as { name: string }).name,
-              inline: true,
+            // Blocked items first (attention-first ordering)
+            if (blocked.length > 0) {
+              const blockedLines = blocked.slice(0, 10).map((i: { identifier?: string | null; id: string; title: string; assigneeName?: string; blockerReason?: string }) => {
+                const reason = i.blockerReason ? ` → ${i.blockerReason}` : "";
+                return `• **${i.identifier ?? i.id}** — ${i.title}${reason}`;
+              }).join("\n");
+              fields.push({ name: `🚫 Blocked (${blocked.length})`, value: blockedLines.slice(0, 1024) });
+            }
+
+            // In Progress with assignee and priority
+            if (inProgress.length > 0) {
+              const ipLines = inProgress.slice(0, 10).map((i: { identifier?: string | null; id: string; title: string; assigneeName?: string; priority?: string }) => {
+                const meta: string[] = [];
+                if (i.assigneeName) meta.push(String(i.assigneeName));
+                if (i.priority) meta.push(humanizePriority(String(i.priority)));
+                const suffix = meta.length > 0 ? ` (${meta.join(", ")})` : "";
+                return `• **${i.identifier ?? i.id}** — ${i.title}${suffix}`;
+              }).join("\n");
+              fields.push({ name: `🔄 In Progress (${inProgress.length})`, value: ipLines.slice(0, 1024) });
+            }
+
+            if (inReview.length > 0) {
+              const reviewLines = inReview.slice(0, 10).map((i: { identifier?: string | null; id: string; title: string }) =>
+                `• **${i.identifier ?? i.id}** — ${i.title}`
+              ).join("\n");
+              fields.push({ name: `🔍 In Review (${inReview.length})`, value: reviewLines.slice(0, 1024) });
+            }
+
+            // Completed: collapse after 3
+            if (completedToday.length > 0) {
+              const shownCompleted = completedToday.slice(0, 3).map((i: { identifier?: string | null; id: string; title: string }) =>
+                `• **${i.identifier ?? i.id}** — ${i.title}`
+              );
+              if (completedToday.length > 3) {
+                shownCompleted.push(`*+ ${completedToday.length - 3} more*`);
+              }
+              fields.push({ name: `✅ Completed Today (${completedToday.length})`, value: shownCompleted.join("\n").slice(0, 1024) });
+            }
+
+            // Summary stats
+            fields.push(
+              { name: "📋 Created Today", value: String(createdToday.length), inline: true },
+              { name: "🤖 Active Agents", value: `${activeAgents.length}/${agents.length}`, inline: true },
+            );
+
+            // Trend line in footer
+            const footerText = `Paperclip • ${completedToday.length} completed, ${blocked.length} blocked, ${inProgress.length} in progress`;
+
+            const digestComponents: DiscordComponent[] = [];
+            const digestButtons: DiscordComponent[] = [
+              { type: 2, style: 5, label: "View Dashboard", url: baseUrl },
+            ];
+            if (blocked.length > 0) {
+              digestButtons.push({
+                type: 2,
+                style: 1,
+                label: "View Blocked",
+                custom_id: `digest_blocked_${company.id}`,
+              });
+            }
+            digestComponents.push({ type: 1, components: digestButtons });
+
+            const embeds: DiscordEmbed[] = [
+              {
+                title: `📊 ${digestLabel}${companyLabel} — ${dateStr}`,
+                color: COLORS.BLUE,
+                fields,
+                footer: { text: footerText },
+                timestamp: new Date().toISOString(),
+              },
+            ];
+
+            await postEmbed(ctx, token, channelId, { embeds, components: digestComponents });
+            await ctx.metrics.write(METRIC_NAMES.digestSent, 1);
+          } catch (err) {
+            ctx.logger.error("Daily digest failed for company", { companyId: company.id, error: String(err) });
+            await postEmbed(ctx, token, channelId, {
+              embeds: [{
+                title: "📊 Daily Digest",
+                description: "Could not generate digest. Check plugin logs for details.",
+                color: COLORS.RED,
+                footer: { text: "Paperclip" },
+                timestamp: new Date().toISOString(),
+              }],
             });
           }
-
-          const formatIssueList = (items: Array<{ identifier?: string | null; id: string; title: string }>) =>
-            items.slice(0, 10).map((i) => `• **${i.identifier ?? i.id}** — ${i.title}`).join("\n");
-
-          if (inProgress.length > 0) {
-            fields.push({ name: `🔄 In Progress (${inProgress.length})`, value: formatIssueList(inProgress) });
-          }
-          if (inReview.length > 0) {
-            fields.push({ name: `🔍 In Review (${inReview.length})`, value: formatIssueList(inReview) });
-          }
-          if (blocked.length > 0) {
-            fields.push({ name: `🚫 Blocked (${blocked.length})`, value: formatIssueList(blocked) });
-          }
-
-          const embeds: DiscordEmbed[] = [
-            {
-              title: `📊 ${digestLabel}${companyLabel} — ${dateStr}`,
-              color: COLORS.BLUE,
-              fields,
-              footer: { text: "Paperclip" },
-              timestamp: new Date().toISOString(),
-            },
-          ];
-
-          await postEmbed(ctx, token, channelId, { embeds });
-          await ctx.metrics.write(METRIC_NAMES.digestSent, 1);
-        } catch (err) {
-          ctx.logger.error("Daily digest failed for company", { companyId: company.id, error: String(err) });
-          await postEmbed(ctx, token, channelId, {
-            embeds: [{
-              title: "📊 Daily Digest",
-              description: "Could not generate digest. Check plugin logs for details.",
-              color: COLORS.RED,
-              footer: { text: "Paperclip" },
-              timestamp: new Date().toISOString(),
-            }],
-          });
-        }
       }
     });
 

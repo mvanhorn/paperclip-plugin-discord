@@ -1,5 +1,5 @@
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
-import type { DiscordMessage } from "./discord-api.js";
+import type { DiscordMessage, DiscordComponent } from "./discord-api.js";
 import { COLORS } from "./constants.js";
 
 type Payload = Record<string, unknown>;
@@ -45,14 +45,28 @@ export function formatIssueCreated(event: PluginEvent, baseUrl?: string): Discor
   const priority = p.priority ? String(p.priority) : null;
   const assigneeName = p.assigneeName ? String(p.assigneeName) : null;
   const projectName = p.projectName ? String(p.projectName) : null;
+  const creatorName = p.creatorName ? String(p.creatorName) : null;
+  const parentIdentifier = p.parentIdentifier ? String(p.parentIdentifier) : null;
+  const parentTitle = p.parentTitle ? String(p.parentTitle) : null;
+  const parentId = p.parentId ? String(p.parentId) : null;
 
   const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
+  if (parentIdentifier) {
+    const parentLine = parentTitle
+      ? `**${parentIdentifier}** — ${parentTitle}`
+      : `**${parentIdentifier}**`;
+    fields.push({ name: "Parent", value: parentLine, inline: true });
+  }
   if (status) fields.push({ name: "Status", value: `\`${humanizeStatus(status)}\``, inline: true });
   if (priority) fields.push({ name: "Priority", value: `\`${humanizePriority(priority)}\``, inline: true });
   if (assigneeName) fields.push({ name: "Assignee", value: assigneeName, inline: true });
   if (projectName) fields.push({ name: "Project", value: projectName, inline: true });
 
-  const knownKeys = new Set(["identifier", "title", "description", "status", "priority", "assigneeName", "projectName", "assigneeAgentId", "projectId"]);
+  const knownKeys = new Set([
+    "identifier", "title", "description", "status", "priority",
+    "assigneeName", "projectName", "assigneeAgentId", "projectId",
+    "creatorName", "parentIdentifier", "parentTitle", "parentId",
+  ]);
   for (const [key, value] of Object.entries(p)) {
     if (knownKeys.has(key) || value == null || value === "") continue;
     const display = typeof value === "object" ? JSON.stringify(value) : String(value);
@@ -61,34 +75,46 @@ export function formatIssueCreated(event: PluginEvent, baseUrl?: string): Discor
     }
   }
 
-  const dashboardUrl = `${resolveBaseUrl(baseUrl)}/issues/${event.entityId}`;
+  const base = resolveBaseUrl(baseUrl);
+  const dashboardUrl = `${base}/issues/${event.entityId}`;
+
+  const footerParts: string[] = [];
+  if (creatorName) footerParts.push(`Created by ${creatorName}`);
+  if (projectName) footerParts.push(projectName);
+  const footerText = footerParts.length > 0 ? footerParts.join(" • ") : "Paperclip";
+
+  const buttons: DiscordComponent[] = [
+    {
+      type: 2,
+      style: 1,
+      label: "Assign to Me",
+      custom_id: `issue_assign_${event.entityId}`,
+    },
+    { type: 2, style: 5, label: "View Issue", url: dashboardUrl },
+  ];
+  if (parentId) {
+    buttons.push({
+      type: 2,
+      style: 5,
+      label: "View Parent",
+      url: `${base}/issues/${parentId}`,
+    });
+  }
 
   return {
     embeds: [
       {
         title: `Issue Created: ${identifier}`,
         description: description
-          ? `**${title}**\n> ${description.slice(0, 300)}`
+          ? `**${title}**\n> ${description.slice(0, 500)}`
           : `**${title}**`,
         color: COLORS.BLUE,
         fields,
-        footer: { text: "Paperclip" },
+        footer: { text: footerText },
         timestamp: event.occurredAt,
       },
     ],
-    components: [
-      {
-        type: 1,
-        components: [
-          {
-            type: 2,
-            style: 5,
-            label: "View Issue",
-            url: dashboardUrl,
-          },
-        ],
-      },
-    ],
+    components: [{ type: 1, components: buttons }],
   };
 }
 
@@ -98,17 +124,44 @@ export function formatIssueDone(event: PluginEvent, baseUrl?: string): DiscordMe
   const title = String(p.title ?? "") || identifier;
   const status = p.status ? String(p.status) : null;
   const priority = p.priority ? String(p.priority) : null;
+  const assigneeName = p.assigneeName ? String(p.assigneeName) : null;
+  const lastComment = p.lastComment ? String(p.lastComment) : null;
+  const parentIdentifier = p.parentIdentifier ? String(p.parentIdentifier) : null;
+  const parentTitle = p.parentTitle ? String(p.parentTitle) : null;
+  const parentId = p.parentId ? String(p.parentId) : null;
 
   const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
+  if (assigneeName) fields.push({ name: "Completed by", value: assigneeName, inline: true });
   if (status) fields.push({ name: "Status", value: `\`${humanizeStatus(status)}\``, inline: true });
   if (priority) fields.push({ name: "Priority", value: `\`${humanizePriority(priority)}\``, inline: true });
+  if (lastComment) fields.push({ name: "Summary", value: lastComment.slice(0, 200) });
+  if (parentIdentifier) {
+    const parentLine = parentTitle
+      ? `**${parentIdentifier}** — ${parentTitle}`
+      : `**${parentIdentifier}**`;
+    fields.push({ name: "Parent", value: parentLine, inline: true });
+  }
 
-  const dashboardUrl = `${resolveBaseUrl(baseUrl)}/issues/${event.entityId}`;
+  const base = resolveBaseUrl(baseUrl);
+  const dashboardUrl = `${base}/issues/${event.entityId}`;
+
+  const buttons: DiscordComponent[] = [
+    { type: 2, style: 5, label: "View Issue", url: dashboardUrl },
+  ];
+  if (p.prUrl) {
+    buttons.push({ type: 2, style: 5, label: "View Diff", url: String(p.prUrl) });
+  }
+  buttons.push({
+    type: 2,
+    style: 4,
+    label: "Reopen",
+    custom_id: `issue_reopen_${event.entityId}`,
+  });
 
   return {
     embeds: [
       {
-        title: `Issue Completed: ${identifier}`,
+        title: `✅ Issue Completed: ${identifier}`,
         description: `**${title}** is now done.`,
         color: COLORS.GREEN,
         fields,
@@ -116,19 +169,7 @@ export function formatIssueDone(event: PluginEvent, baseUrl?: string): DiscordMe
         timestamp: event.occurredAt,
       },
     ],
-    components: [
-      {
-        type: 1,
-        components: [
-          {
-            type: 2,
-            style: 5,
-            label: "View Issue",
-            url: dashboardUrl,
-          },
-        ],
-      },
-    ],
+    components: [{ type: 1, components: buttons }],
   };
 }
 

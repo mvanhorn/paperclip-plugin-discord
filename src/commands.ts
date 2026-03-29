@@ -1257,6 +1257,85 @@ async function handleButtonClick(
     return handleWorkflowApprovalButton(ctx, customId, actor, cmdCtx);
   }
 
+  if (customId.startsWith("issue_reopen_")) {
+    const issueId = customId.replace("issue_reopen_", "");
+    ctx.logger.info("Reopen button clicked", { issueId, actor });
+    try {
+      const resp = await withRetry(async () => {
+        const r = await paperclipFetch(`${base}/api/issues/${issueId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: "todo", comment: `Reopened by ${actor} via Discord` }),
+        });
+        throwOnRetryableStatus(r);
+        return r;
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`API ${resp.status}: ${body}`);
+      }
+    } catch (err) {
+      ctx.logger.error("Failed to reopen issue", { issueId, error: String(err) });
+      return {
+        type: 7,
+        data: {
+          embeds: [{ title: "Reopen Failed", description: `Could not reopen — ${err instanceof Error ? err.message : String(err)}`, color: COLORS.RED, footer: { text: "Paperclip" }, timestamp: new Date().toISOString() }],
+          components: [],
+        },
+      };
+    }
+    return {
+      type: 7,
+      data: {
+        embeds: [{ title: "Issue Reopened", description: `Reopened by **${actor}**`, color: COLORS.YELLOW, footer: { text: "Paperclip" }, timestamp: new Date().toISOString() }],
+        components: [],
+      },
+    };
+  }
+
+  if (customId.startsWith("issue_assign_")) {
+    const issueId = customId.replace("issue_assign_", "");
+    ctx.logger.info("Assign to Me button clicked", { issueId, actor });
+    try {
+      const resp = await withRetry(async () => {
+        const r = await paperclipFetch(`${base}/api/issues/${issueId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ assigneeUserId: `discord:${actor}`, comment: `Assigned to ${actor} via Discord` }),
+        });
+        throwOnRetryableStatus(r);
+        return r;
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`API ${resp.status}: ${body}`);
+      }
+    } catch (err) {
+      ctx.logger.error("Failed to assign issue", { issueId, error: String(err) });
+      return respondToInteraction({ type: 4, content: `Could not assign — ${err instanceof Error ? err.message : String(err)}`, ephemeral: true });
+    }
+    return respondToInteraction({ type: 4, content: `✅ Assigned to **${actor}**`, ephemeral: true });
+  }
+
+  if (customId.startsWith("digest_blocked_")) {
+    const companyId = customId.replace("digest_blocked_", "");
+    ctx.logger.info("View Blocked button clicked", { companyId, actor });
+    try {
+      const issues = await ctx.issues.list({ companyId, status: "blocked", limit: 20 });
+      if (issues.length === 0) {
+        return respondToInteraction({ type: 4, content: "No blocked issues found.", ephemeral: true });
+      }
+      const lines = issues.map((i: { identifier?: string | null; id: string; title: string; blockerReason?: string }) => {
+        const reason = i.blockerReason ? `\n  → ${i.blockerReason}` : "";
+        return `• **${i.identifier ?? i.id}** — ${i.title}${reason}`;
+      });
+      return respondToInteraction({ type: 4, content: `🚫 **Blocked Issues (${issues.length})**\n\n${lines.join("\n").slice(0, 1900)}`, ephemeral: true });
+    } catch (err) {
+      ctx.logger.error("Failed to fetch blocked issues", { companyId, error: String(err) });
+      return respondToInteraction({ type: 4, content: `Could not fetch blocked issues — ${err instanceof Error ? err.message : String(err)}`, ephemeral: true });
+    }
+  }
+
   return respondToInteraction({
     type: 4,
     content: "Unknown button action.",
