@@ -6,6 +6,8 @@ import {
   formatAgentError,
   formatAgentRunStarted,
   formatAgentRunFinished,
+  humanizeStatus,
+  humanizePriority,
 } from "../src/formatters.js";
 import { COLORS } from "../src/constants.js";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
@@ -171,12 +173,12 @@ describe("formatAgentError", () => {
 });
 
 describe("formatAgentRunStarted", () => {
-  it("formats run started with blue color", () => {
+  it("formats run started with blue color and agent name in title", () => {
     const msg = formatAgentRunStarted(
       makeEvent({ payload: { agentName: "BD Agent" } }),
     );
     expect(msg.embeds?.[0]?.color).toBe(COLORS.BLUE);
-    expect(msg.embeds?.[0]?.title).toBe("Agent Run Started");
+    expect(msg.embeds?.[0]?.title).toBe("Run Started: BD Agent");
     expect(msg.embeds?.[0]?.description).toContain("BD Agent");
   });
 
@@ -184,16 +186,47 @@ describe("formatAgentRunStarted", () => {
     const msg = formatAgentRunStarted(makeEvent({ entityId: "fallback-agent" }));
     expect(msg.embeds?.[0]?.description).toContain("fallback-agent");
   });
+
+  it("includes task context when issueIdentifier is provided", () => {
+    const msg = formatAgentRunStarted(
+      makeEvent({ payload: { agentName: "Engineer", issueIdentifier: "TUM-54", issueTitle: "Humanize output" } }),
+    );
+    expect(msg.embeds?.[0]?.description).toContain("TUM-54");
+    expect(msg.embeds?.[0]?.description).toContain("Humanize output");
+  });
+
+  it("shows issueIdentifier without title when title is absent", () => {
+    const msg = formatAgentRunStarted(
+      makeEvent({ payload: { agentName: "Engineer", issueIdentifier: "TUM-54" } }),
+    );
+    expect(msg.embeds?.[0]?.description).toContain("TUM-54");
+    expect(msg.embeds?.[0]?.description).not.toContain("—");
+  });
+
+  it("omits task line when no issue context", () => {
+    const msg = formatAgentRunStarted(
+      makeEvent({ payload: { agentName: "Engineer" } }),
+    );
+    expect(msg.embeds?.[0]?.description).not.toContain("Task:");
+  });
 });
 
 describe("formatAgentRunFinished", () => {
-  it("formats run finished with green color", () => {
+  it("formats run finished with green color and agent name in title", () => {
     const msg = formatAgentRunFinished(
       makeEvent({ payload: { agentName: "BD Agent" } }),
     );
     expect(msg.embeds?.[0]?.color).toBe(COLORS.GREEN);
-    expect(msg.embeds?.[0]?.title).toBe("Agent Run Finished");
+    expect(msg.embeds?.[0]?.title).toBe("Run Finished: BD Agent");
     expect(msg.embeds?.[0]?.description).toContain("completed successfully");
+  });
+
+  it("includes task context when issueIdentifier is provided", () => {
+    const msg = formatAgentRunFinished(
+      makeEvent({ payload: { agentName: "Engineer", issueIdentifier: "TUM-54", issueTitle: "Fix bug" } }),
+    );
+    expect(msg.embeds?.[0]?.description).toContain("TUM-54");
+    expect(msg.embeds?.[0]?.description).toContain("Fix bug");
   });
 });
 
@@ -321,5 +354,58 @@ describe("approval View button URL uses configured base URL", () => {
     );
     const viewBtn = msg.components?.[0]?.components?.[0];
     expect(viewBtn?.url).toBe("https://app.paperclip.ing/issues/issue-42");
+  });
+});
+
+describe("humanizeStatus", () => {
+  it("converts known statuses to readable labels", () => {
+    expect(humanizeStatus("todo")).toBe("To Do");
+    expect(humanizeStatus("in_progress")).toBe("In Progress");
+    expect(humanizeStatus("in_review")).toBe("In Review");
+    expect(humanizeStatus("done")).toBe("Done");
+    expect(humanizeStatus("blocked")).toBe("Blocked");
+    expect(humanizeStatus("backlog")).toBe("Backlog");
+    expect(humanizeStatus("cancelled")).toBe("Cancelled");
+  });
+
+  it("returns raw value for unknown statuses", () => {
+    expect(humanizeStatus("custom_status")).toBe("custom_status");
+  });
+});
+
+describe("humanizePriority", () => {
+  it("converts known priorities to readable labels", () => {
+    expect(humanizePriority("critical")).toBe("Critical");
+    expect(humanizePriority("high")).toBe("High");
+    expect(humanizePriority("medium")).toBe("Medium");
+    expect(humanizePriority("low")).toBe("Low");
+  });
+
+  it("returns raw value for unknown priorities", () => {
+    expect(humanizePriority("urgent")).toBe("urgent");
+  });
+});
+
+describe("humanized status and priority in issue embeds", () => {
+  it("issue created embed shows humanized status", () => {
+    const msg = formatIssueCreated(
+      makeEvent({ payload: { identifier: "X-1", title: "Test", status: "in_progress", priority: "high" } }),
+    );
+    const fields = msg.embeds?.[0]?.fields ?? [];
+    const statusField = fields.find((f) => f.name === "Status");
+    const priorityField = fields.find((f) => f.name === "Priority");
+    expect(statusField?.value).toBe("`In Progress`");
+    expect(priorityField?.value).toBe("`High`");
+  });
+
+  it("issue done embed shows humanized status", () => {
+    const msg = formatIssueDone(
+      makeEvent({ payload: { identifier: "X-1", status: "done", priority: "low" } }),
+    );
+    const fields = msg.embeds?.[0]?.fields ?? [];
+    const statusField = fields.find((f) => f.name === "Status");
+    const priorityField = fields.find((f) => f.name === "Priority");
+    expect(statusField?.value).toBe("`Done`");
+    expect(priorityField?.value).toBe("`Low`");
   });
 });

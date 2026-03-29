@@ -109,6 +109,30 @@ describe("/clip status", () => {
     expect(embed.fields[1].value).toContain("PROJ-1");
   });
 
+  it("shows agent title in status when available", async () => {
+    const ctx = makeCtx({
+      agents: {
+        list: vi.fn().mockResolvedValue([
+          { id: "a1", name: "CEO", title: "Chief Executive Officer" },
+        ]),
+        sessions: { create: vi.fn(), sendMessage: vi.fn(), close: vi.fn() },
+        invoke: vi.fn(),
+      },
+      issues: {
+        list: vi.fn().mockResolvedValue([]),
+      },
+    });
+
+    const result = await handleInteraction(
+      ctx,
+      { type: 2, data: { name: "clip", options: [{ name: "status" }] } },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(result.data.embeds[0].fields[0].value).toContain("CEO");
+    expect(result.data.embeds[0].fields[0].value).toContain("Chief Executive Officer");
+  });
+
   it("handles empty agents and issues", async () => {
     const ctx = makeCtx();
     const result = await handleInteraction(

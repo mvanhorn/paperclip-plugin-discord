@@ -1,6 +1,7 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { type DiscordEmbed, respondToInteraction } from "./discord-api.js";
 import { COLORS, METRIC_NAMES } from "./constants.js";
+import { humanizeStatus } from "./formatters.js";
 import { withRetry, throwOnRetryableStatus } from "./retry.js";
 import { paperclipFetch } from "./paperclip-fetch.js";
 import { handleHandoffButton, handleDiscussionButton, handleAcpCommand } from "./session-registry.js";
@@ -395,7 +396,11 @@ async function handleStatus(ctx: PluginContext, companyId: string): Promise<unkn
     const issues = await ctx.issues.list({ companyId, status: "done", limit: 5 });
 
     const agentList = agents.length > 0
-      ? agents.map((a: { name?: string; id: string }) => `- **${a.name ?? a.id}**`).join("\n")
+      ? agents.map((a: { name?: string | null; id: string; title?: string | null; role?: string | null }) => {
+          const label = a.name ?? a.id;
+          const detail = a.title || a.role;
+          return detail ? `- **${label}** — ${detail}` : `- **${label}**`;
+        }).join("\n")
       : "No active agents";
 
     const issueList = issues.length > 0
@@ -462,7 +467,7 @@ async function handleApprove(
       type: 4,
       embeds: [{
         title: "Approval Resolved",
-        description: `**Approved** \`${approvalId}\` by ${username ?? "Discord user"}`,
+        description: `Approved by **${username ?? "Discord user"}**.`,
         color: COLORS.GREEN,
         footer: { text: "Paperclip" },
         timestamp: new Date().toISOString(),
@@ -575,7 +580,7 @@ async function handleIssues(
       const emoji = statusEmoji[i.status] ?? "📋";
       const id = i.identifier ?? i.id;
       return {
-        name: `${emoji} ${id}`,
+        name: `${emoji} ${id} — ${humanizeStatus(i.status)}`,
         value: i.title ?? "(untitled)",
       };
     });
@@ -612,9 +617,18 @@ async function handleAgents(ctx: PluginContext, companyId: string): Promise<unkn
       active: "🟢", error: "🔴", paused: "🟡", idle: "⚪", running: "🔵",
     };
 
-    const lines = agents.map((a: { name?: string; id: string; status: string }) => {
+    const statusLabel: Record<string, string> = {
+      active: "Active", error: "Error", paused: "Paused", idle: "Idle", running: "Running",
+    };
+
+    const lines = agents.map((a: { name?: string | null; id: string; status: string; title?: string | null; role?: string | null }) => {
       const emoji = statusEmoji[a.status] ?? "⚪";
-      return `${emoji} **${a.name ?? a.id}** — ${a.status}`;
+      const label = a.name ?? a.id;
+      const detail = a.title || a.role;
+      const statusText = statusLabel[a.status] ?? a.status;
+      return detail
+        ? `${emoji} **${label}** — ${detail} · ${statusText}`
+        : `${emoji} **${label}** — ${statusText}`;
     });
 
     const embeds: DiscordEmbed[] = [

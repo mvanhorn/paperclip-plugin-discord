@@ -342,7 +342,7 @@ export async function spawnAgentInThread(
       embeds: [
         {
           title: `Agent Joined: ${agentName}`,
-          description: `**${agentName}** has joined the thread (${transport}). ${running.length + 1} agents active.\nSession: \`${sessionId}\``,
+          description: `**${agentName}** has joined the thread. ${running.length + 1} agents active.`,
           color: COLORS.BLUE,
           footer: { text: "Paperclip" },
           timestamp: now,
@@ -396,7 +396,7 @@ export async function closeAgentInThread(
     embeds: [
       {
         title: `Agent Closed: ${agentName}`,
-        description: `**${agentName}** session \`${target.sessionId}\` has been closed.`,
+        description: `**${agentName}** has been closed.`,
         color: COLORS.GRAY,
         footer: { text: "Paperclip" },
         timestamp: new Date().toISOString(),
@@ -572,8 +572,8 @@ export async function handleAcpOutput(
     await postEmbed(ctx, token, threadId, {
       embeds: [
         {
-          title: status === "completed" ? "Agent Completed" : "Agent Failed",
-          description: `**${agentName}** session \`${sessionId}\` ${status}.`,
+          title: status === "completed" ? `Agent Completed: ${agentName}` : `Agent Failed: ${agentName}`,
+          description: `**${agentName}** has ${status === "completed" ? "finished successfully" : "encountered an error"}.`,
           color: status === "completed" ? COLORS.GREEN : COLORS.RED,
           footer: { text: "Paperclip" },
           timestamp: new Date().toISOString(),
@@ -1126,7 +1126,7 @@ export async function handleAcpCommand(
 
       return respondToInteraction({
         type: 4,
-        content: `Spawned **${agentName}** (${result.transport}) in thread.\nSession: \`${result.sessionId}\``,
+        content: `Spawned **${agentName}** in thread.`,
       });
     }
 

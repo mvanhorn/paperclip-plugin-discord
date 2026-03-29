@@ -77,7 +77,9 @@ describe("/clip issues", () => {
     expect(result.data.embeds[0].fields).toHaveLength(2);
     expect(result.data.embeds[0].fields[0].name).toContain("🔄");
     expect(result.data.embeds[0].fields[0].name).toContain("TUM-1");
+    expect(result.data.embeds[0].fields[0].name).toContain("In Progress");
     expect(result.data.embeds[0].fields[1].name).toContain("📋");
+    expect(result.data.embeds[0].fields[1].name).toContain("To Do");
   });
 
   it("filters by project name", async () => {
@@ -142,6 +144,31 @@ describe("/clip agents", () => {
     expect(result.data.embeds[0].description).toContain("🔵");
     expect(result.data.embeds[0].description).toContain("🟡");
     expect(result.data.embeds[0].description).toContain("CEO");
+  });
+
+  it("shows agent title or role when available", async () => {
+    const ctx = makeCtx({
+      agents: {
+        list: vi.fn().mockResolvedValue([
+          { id: "a1", name: "CEO", status: "active", title: "Chief Executive Officer" },
+          { id: "a2", name: "Engineer", status: "running", role: "engineer" },
+          { id: "a3", name: "QA", status: "paused" },
+        ]),
+        sessions: { create: vi.fn(), sendMessage: vi.fn(), close: vi.fn() },
+        invoke: vi.fn(),
+      },
+    });
+
+    const result = (await handleInteraction(ctx, clipInteraction("agents"), defaultCmdCtx)) as any;
+    const desc = result.data.embeds[0].description;
+    expect(desc).toContain("Chief Executive Officer");
+    expect(desc).toContain("engineer");
+    // QA has no title/role, should just show name and status
+    expect(desc).toContain("QA");
+    // Should show humanized status labels
+    expect(desc).toContain("Active");
+    expect(desc).toContain("Running");
+    expect(desc).toContain("Paused");
   });
 
   it("returns empty state when no agents", async () => {

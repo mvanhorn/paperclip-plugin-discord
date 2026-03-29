@@ -6,6 +6,31 @@ type Payload = Record<string, unknown>;
 
 const DEFAULT_BASE_URL = "http://localhost:3100";
 
+const STATUS_LABELS: Record<string, string> = {
+  todo: "To Do",
+  in_progress: "In Progress",
+  in_review: "In Review",
+  done: "Done",
+  blocked: "Blocked",
+  backlog: "Backlog",
+  cancelled: "Cancelled",
+};
+
+const PRIORITY_LABELS: Record<string, string> = {
+  critical: "Critical",
+  high: "High",
+  medium: "Medium",
+  low: "Low",
+};
+
+export function humanizeStatus(raw: string): string {
+  return STATUS_LABELS[raw] ?? raw;
+}
+
+export function humanizePriority(raw: string): string {
+  return PRIORITY_LABELS[raw] ?? raw;
+}
+
 function resolveBaseUrl(baseUrl?: string): string {
   const url = baseUrl || DEFAULT_BASE_URL;
   return url.endsWith("/") ? url.slice(0, -1) : url;
@@ -22,8 +47,8 @@ export function formatIssueCreated(event: PluginEvent, baseUrl?: string): Discor
   const projectName = p.projectName ? String(p.projectName) : null;
 
   const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
-  if (status) fields.push({ name: "Status", value: `\`${status}\``, inline: true });
-  if (priority) fields.push({ name: "Priority", value: `\`${priority}\``, inline: true });
+  if (status) fields.push({ name: "Status", value: `\`${humanizeStatus(status)}\``, inline: true });
+  if (priority) fields.push({ name: "Priority", value: `\`${humanizePriority(priority)}\``, inline: true });
   if (assigneeName) fields.push({ name: "Assignee", value: assigneeName, inline: true });
   if (projectName) fields.push({ name: "Project", value: projectName, inline: true });
 
@@ -75,8 +100,8 @@ export function formatIssueDone(event: PluginEvent, baseUrl?: string): DiscordMe
   const priority = p.priority ? String(p.priority) : null;
 
   const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
-  if (status) fields.push({ name: "Status", value: `\`${status}\``, inline: true });
-  if (priority) fields.push({ name: "Priority", value: `\`${priority}\``, inline: true });
+  if (status) fields.push({ name: "Status", value: `\`${humanizeStatus(status)}\``, inline: true });
+  if (priority) fields.push({ name: "Priority", value: `\`${humanizePriority(priority)}\``, inline: true });
 
   const dashboardUrl = `${resolveBaseUrl(baseUrl)}/issues/${event.entityId}`;
 
@@ -211,12 +236,18 @@ export function formatAgentError(event: PluginEvent): DiscordMessage {
 export function formatAgentRunStarted(event: PluginEvent): DiscordMessage {
   const p = event.payload as Payload;
   const agentName = String(p.agentName ?? event.entityId);
+  const issueIdentifier = p.issueIdentifier ? String(p.issueIdentifier) : null;
+  const issueTitle = p.issueTitle ? String(p.issueTitle) : null;
+
+  const taskLine = issueIdentifier
+    ? `\nTask: **${issueIdentifier}**${issueTitle ? ` — ${issueTitle}` : ""}`
+    : "";
 
   return {
     embeds: [
       {
-        title: "Agent Run Started",
-        description: `**${agentName}** has started a new run.`,
+        title: `Run Started: ${agentName}`,
+        description: `**${agentName}** has started a new run.${taskLine}`,
         color: COLORS.BLUE,
         footer: { text: "Paperclip" },
         timestamp: event.occurredAt,
@@ -228,12 +259,18 @@ export function formatAgentRunStarted(event: PluginEvent): DiscordMessage {
 export function formatAgentRunFinished(event: PluginEvent): DiscordMessage {
   const p = event.payload as Payload;
   const agentName = String(p.agentName ?? event.entityId);
+  const issueIdentifier = p.issueIdentifier ? String(p.issueIdentifier) : null;
+  const issueTitle = p.issueTitle ? String(p.issueTitle) : null;
+
+  const taskLine = issueIdentifier
+    ? `\nTask: **${issueIdentifier}**${issueTitle ? ` — ${issueTitle}` : ""}`
+    : "";
 
   return {
     embeds: [
       {
-        title: "Agent Run Finished",
-        description: `**${agentName}** completed successfully.`,
+        title: `Run Finished: ${agentName}`,
+        description: `**${agentName}** completed successfully.${taskLine}`,
         color: COLORS.GREEN,
         footer: { text: "Paperclip" },
         timestamp: event.occurredAt,

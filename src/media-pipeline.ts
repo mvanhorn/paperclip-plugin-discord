@@ -85,7 +85,7 @@ export async function transcribeAudio(
       prompt: `Transcribe the audio file at: ${audioUrl}`,
       reason: "Discord media pipeline transcription",
     });
-    return (result as { runId: string }).runId ? `Transcription job started (run: ${(result as { runId: string }).runId})` : null;
+    return (result as { runId: string }).runId ? "Transcription started — results will appear when ready." : null;
   } catch (err) {
     ctx.logger.warn("Whisper transcription invoke failed", {
       error: err instanceof Error ? err.message : String(err),
