@@ -178,6 +178,26 @@ describe("event deduplication", () => {
     );
   });
 
+  it("uses manifest defaults when saved config omits notify flags", async () => {
+    const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext();
+    const configGet = ctx.config.get as ReturnType<typeof vi.fn>;
+    configGet.mockResolvedValueOnce({
+      discordBotTokenRef: "fake-secret-ref",
+      defaultGuildId: "",
+      defaultChannelId: "ch-1",
+    });
+
+    await getSetup()(ctx);
+
+    const event = makeEvent("issue.created", "evt-defaulted-1", {
+      title: "Defaulted config issue",
+      identifier: "TST-DEFAULT",
+    });
+
+    await emitEvent(eventHandlers, "issue.created", event);
+    expect(mockDiscordFetch).toHaveBeenCalled();
+  });
+
   it("issue.updated (done): first delivery posts, duplicate is skipped", async () => {
     const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext({
       notifyOnIssueDone: true,

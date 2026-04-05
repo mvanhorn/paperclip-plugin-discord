@@ -6,7 +6,7 @@ import {
   type PluginWebhookInput,
   type PluginHealthDiagnostics,
 } from "@paperclipai/plugin-sdk";
-import { COLORS, METRIC_NAMES, PLUGIN_ID, WEBHOOK_KEYS, ACP_PLUGIN_EVENT_PREFIX, BUDGET_ALERT_THRESHOLD } from "./constants.js";
+import { DEFAULT_CONFIG, COLORS, METRIC_NAMES, PLUGIN_ID, WEBHOOK_KEYS, ACP_PLUGIN_EVENT_PREFIX, BUDGET_ALERT_THRESHOLD } from "./constants.js";
 import { paperclipFetch } from "./paperclip-fetch.js";
 import {
   postEmbed,
@@ -123,7 +123,10 @@ const plugin = definePlugin({
   async setup(ctx) {
     const rawConfig = await ctx.config.get();
     ctx.logger.info(`Discord plugin config: ${JSON.stringify(rawConfig)}`);
-    const config = rawConfig as unknown as DiscordConfig;
+    const config = {
+      ...DEFAULT_CONFIG,
+      ...(rawConfig as Record<string, unknown>),
+    } as DiscordConfig;
 
     if (!config.discordBotTokenRef) {
       ctx.logger.warn("No discordBotTokenRef configured, plugin disabled");
