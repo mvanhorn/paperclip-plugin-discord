@@ -1208,6 +1208,47 @@ describe("issue_assign button", () => {
     expect(result.data.flags).toBe(64);
   });
 
+  it("returns a clearer message when the Discord user is not linked to a board user", async () => {
+    const ctx = makeCtx();
+    ctx.companies.list = vi.fn().mockResolvedValue([{ id: "c1", name: "Acme" }]);
+    ctx.issues.get = vi.fn().mockResolvedValue({ id: "iss-unmapped" });
+    ctx.issues.update = vi.fn().mockRejectedValue(new Error("Assignee user not found"));
+
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "issue_assign_iss-unmapped" },
+        member: { user: { username: "discord-user" } },
+      },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(result.type).toBe(4);
+    expect(result.data.content).toContain("not linked to a Paperclip board user");
+  });
+
+  it("does not attempt reassignment when the issue already has an assignee", async () => {
+    const ctx = makeCtx();
+    ctx.companies.list = vi.fn().mockResolvedValue([{ id: "c1", name: "Acme" }]);
+    ctx.issues.get = vi.fn().mockResolvedValue({ id: "iss-assigned", assigneeUserId: "board-user" });
+    ctx.issues.update = vi.fn();
+
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "issue_assign_iss-assigned" },
+        member: { user: { username: "discord-user" } },
+      },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(result.type).toBe(4);
+    expect(result.data.content).toContain("already has an assignee");
+    expect(ctx.issues.update).not.toHaveBeenCalled();
+  });
+
   it("sends assigneeUserId with discord prefix in update patch", async () => {
     const ctx = makeCtx();
     ctx.companies.list = vi.fn().mockResolvedValue([{ id: "c1", name: "Acme" }]);

@@ -1312,6 +1312,19 @@ async function handleButtonClick(
     ctx.logger.info("Assign to Me button clicked", { issueId, actor });
     try {
       const issueCompanyId = await resolveIssueCompanyId(ctx, issueId);
+      const issue = await ctx.issues.get(issueId, issueCompanyId) as {
+        assigneeUserId?: string | null;
+        assigneeAgentId?: string | null;
+      } | null;
+
+      if (issue?.assigneeUserId || issue?.assigneeAgentId) {
+        return respondToInteraction({
+          type: 4,
+          content: "Could not assign — issue already has an assignee.",
+          ephemeral: true,
+        });
+      }
+
       await ctx.issues.update(
         issueId,
         { assigneeUserId: `discord:${actor}` } as Record<string, unknown>,
@@ -1319,7 +1332,11 @@ async function handleButtonClick(
       );
     } catch (err) {
       ctx.logger.error("Failed to assign issue", { issueId, error: String(err) });
-      return respondToInteraction({ type: 4, content: `Could not assign — ${err instanceof Error ? err.message : String(err)}`, ephemeral: true });
+      const rawMessage = err instanceof Error ? err.message : String(err);
+      const friendlyMessage = rawMessage.includes("Assignee user not found")
+        ? "your Discord user is not linked to a Paperclip board user"
+        : rawMessage;
+      return respondToInteraction({ type: 4, content: `Could not assign — ${friendlyMessage}`, ephemeral: true });
     }
     return respondToInteraction({ type: 4, content: `✅ Assigned to **${actor}**`, ephemeral: true });
   }
