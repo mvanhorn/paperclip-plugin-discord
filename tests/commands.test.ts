@@ -30,6 +30,8 @@ function makeCtx(overrides: Record<string, unknown> = {}) {
     },
     issues: {
       list: vi.fn().mockResolvedValue([]),
+      get: vi.fn().mockResolvedValue(null),
+      update: vi.fn().mockResolvedValue({}),
     },
     companies: {
       list: vi.fn().mockResolvedValue([]),
@@ -1101,8 +1103,10 @@ describe("SLASH_COMMANDS", () => {
 
 describe("issue_reopen button", () => {
   it("calls PATCH to reopen the issue and returns type 7 success", async () => {
-    mockPaperclipFetch.mockResolvedValue({ ok: true, status: 200, headers: new Headers(), text: () => Promise.resolve("") });
     const ctx = makeCtx();
+    ctx.companies.list = vi.fn().mockResolvedValue([{ id: "c1", name: "Acme" }]);
+    ctx.issues.get = vi.fn().mockResolvedValue({ id: "iss-42" });
+    ctx.issues.update = vi.fn().mockResolvedValue({ id: "iss-42", status: "todo" });
     const cmdCtx = { ...defaultCmdCtx, baseUrl: "https://app.example.com" };
     const result = await handleInteraction(
       ctx,
@@ -1114,10 +1118,7 @@ describe("issue_reopen button", () => {
       cmdCtx,
     ) as any;
 
-    expect(mockPaperclipFetch).toHaveBeenCalledWith(
-      "https://app.example.com/api/issues/iss-42",
-      expect.objectContaining({ method: "PATCH" }),
-    );
+    expect(ctx.issues.update).toHaveBeenCalledWith("iss-42", { status: "todo" }, "c1");
     expect(result.type).toBe(7);
     expect(result.data.embeds[0].title).toBe("Issue Reopened");
     expect(result.data.embeds[0].description).toContain("reviewer");
@@ -1126,8 +1127,10 @@ describe("issue_reopen button", () => {
   });
 
   it("returns error embed when API fails", async () => {
-    mockPaperclipFetch.mockResolvedValue({ ok: false, status: 422, headers: new Headers(), text: () => Promise.resolve("Unprocessable Entity") });
     const ctx = makeCtx();
+    ctx.companies.list = vi.fn().mockResolvedValue([{ id: "c1", name: "Acme" }]);
+    ctx.issues.get = vi.fn().mockResolvedValue({ id: "iss-fail" });
+    ctx.issues.update = vi.fn().mockRejectedValue(new Error("Unprocessable Entity"));
     const result = await handleInteraction(
       ctx,
       {
@@ -1144,9 +1147,11 @@ describe("issue_reopen button", () => {
     expect(result.data.components).toEqual([]);
   });
 
-  it("sets status to todo in the PATCH body", async () => {
-    mockPaperclipFetch.mockResolvedValue({ ok: true, status: 200, headers: new Headers(), text: () => Promise.resolve("") });
+  it("sets status to todo in the update patch", async () => {
     const ctx = makeCtx();
+    ctx.companies.list = vi.fn().mockResolvedValue([{ id: "c1", name: "Acme" }]);
+    ctx.issues.get = vi.fn().mockResolvedValue({ id: "iss-99" });
+    ctx.issues.update = vi.fn().mockResolvedValue({ id: "iss-99", status: "todo" });
     await handleInteraction(
       ctx,
       {
@@ -1157,16 +1162,16 @@ describe("issue_reopen button", () => {
       defaultCmdCtx,
     );
 
-    const body = JSON.parse(mockPaperclipFetch.mock.calls[0][1].body);
-    expect(body.status).toBe("todo");
-    expect(body.comment).toContain("user1");
+    expect(ctx.issues.update).toHaveBeenCalledWith("iss-99", { status: "todo" }, "c1");
   });
 });
 
 describe("issue_assign button", () => {
-  it("calls PATCH to assign and returns ephemeral success", async () => {
-    mockPaperclipFetch.mockResolvedValue({ ok: true, status: 200, headers: new Headers(), text: () => Promise.resolve("") });
+  it("updates the issue assignee and returns ephemeral success", async () => {
     const ctx = makeCtx();
+    ctx.companies.list = vi.fn().mockResolvedValue([{ id: "c1", name: "Acme" }]);
+    ctx.issues.get = vi.fn().mockResolvedValue({ id: "iss-55" });
+    ctx.issues.update = vi.fn().mockResolvedValue({ id: "iss-55", assigneeUserId: "discord:assignee" });
     const result = await handleInteraction(
       ctx,
       {
@@ -1177,18 +1182,17 @@ describe("issue_assign button", () => {
       defaultCmdCtx,
     ) as any;
 
-    expect(mockPaperclipFetch).toHaveBeenCalledWith(
-      "http://localhost:3100/api/issues/iss-55",
-      expect.objectContaining({ method: "PATCH" }),
-    );
+    expect(ctx.issues.update).toHaveBeenCalledWith("iss-55", { assigneeUserId: "discord:assignee" }, "c1");
     expect(result.type).toBe(4);
     expect(result.data.content).toContain("assignee");
     expect(result.data.flags).toBe(64); // ephemeral
   });
 
-  it("returns ephemeral error when API fails", async () => {
-    mockPaperclipFetch.mockResolvedValue({ ok: false, status: 403, headers: new Headers(), text: () => Promise.resolve("Forbidden") });
+  it("returns ephemeral error when update fails", async () => {
     const ctx = makeCtx();
+    ctx.companies.list = vi.fn().mockResolvedValue([{ id: "c1", name: "Acme" }]);
+    ctx.issues.get = vi.fn().mockResolvedValue({ id: "iss-denied" });
+    ctx.issues.update = vi.fn().mockRejectedValue(new Error("Forbidden"));
     const result = await handleInteraction(
       ctx,
       {
@@ -1204,9 +1208,11 @@ describe("issue_assign button", () => {
     expect(result.data.flags).toBe(64);
   });
 
-  it("sends assigneeUserId with discord prefix in body", async () => {
-    mockPaperclipFetch.mockResolvedValue({ ok: true, status: 200, headers: new Headers(), text: () => Promise.resolve("") });
+  it("sends assigneeUserId with discord prefix in update patch", async () => {
     const ctx = makeCtx();
+    ctx.companies.list = vi.fn().mockResolvedValue([{ id: "c1", name: "Acme" }]);
+    ctx.issues.get = vi.fn().mockResolvedValue({ id: "iss-77" });
+    ctx.issues.update = vi.fn().mockResolvedValue({ id: "iss-77", assigneeUserId: "discord:bob" });
     await handleInteraction(
       ctx,
       {
@@ -1217,8 +1223,7 @@ describe("issue_assign button", () => {
       defaultCmdCtx,
     );
 
-    const body = JSON.parse(mockPaperclipFetch.mock.calls[0][1].body);
-    expect(body.assigneeUserId).toBe("discord:bob");
+    expect(ctx.issues.update).toHaveBeenCalledWith("iss-77", { assigneeUserId: "discord:bob" }, "c1");
   });
 });
 

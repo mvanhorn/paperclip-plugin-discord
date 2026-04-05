@@ -1286,19 +1286,8 @@ async function handleButtonClick(
     const issueId = customId.replace("issue_reopen_", "");
     ctx.logger.info("Reopen button clicked", { issueId, actor });
     try {
-      const resp = await withRetry(async () => {
-        const r = await paperclipFetch(`${base}/api/issues/${issueId}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ status: "todo", comment: `Reopened by ${actor} via Discord` }),
-        });
-        throwOnRetryableStatus(r);
-        return r;
-      });
-      if (!resp.ok) {
-        const body = await resp.text().catch(() => "");
-        throw new Error(`API ${resp.status}: ${body}`);
-      }
+      const issueCompanyId = await resolveIssueCompanyId(ctx, issueId);
+      await ctx.issues.update(issueId, { status: "todo" }, issueCompanyId);
     } catch (err) {
       ctx.logger.error("Failed to reopen issue", { issueId, error: String(err) });
       return {
@@ -1322,19 +1311,12 @@ async function handleButtonClick(
     const issueId = customId.replace("issue_assign_", "");
     ctx.logger.info("Assign to Me button clicked", { issueId, actor });
     try {
-      const resp = await withRetry(async () => {
-        const r = await paperclipFetch(`${base}/api/issues/${issueId}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ assigneeUserId: `discord:${actor}`, comment: `Assigned to ${actor} via Discord` }),
-        });
-        throwOnRetryableStatus(r);
-        return r;
-      });
-      if (!resp.ok) {
-        const body = await resp.text().catch(() => "");
-        throw new Error(`API ${resp.status}: ${body}`);
-      }
+      const issueCompanyId = await resolveIssueCompanyId(ctx, issueId);
+      await ctx.issues.update(
+        issueId,
+        { assigneeUserId: `discord:${actor}` } as Record<string, unknown>,
+        issueCompanyId,
+      );
     } catch (err) {
       ctx.logger.error("Failed to assign issue", { issueId, error: String(err) });
       return respondToInteraction({ type: 4, content: `Could not assign — ${err instanceof Error ? err.message : String(err)}`, ephemeral: true });
@@ -1495,6 +1477,18 @@ async function handleEscalationButton(
     default:
       return respondToInteraction({ type: 4, content: `Unknown escalation action: ${action}`, ephemeral: true });
   }
+}
+
+async function resolveIssueCompanyId(
+  ctx: PluginContext,
+  issueId: string,
+): Promise<string> {
+  const companies = await ctx.companies.list();
+  for (const company of companies) {
+    const issue = await ctx.issues.get(issueId, company.id);
+    if (issue) return company.id;
+  }
+  throw new Error(`Issue not found: ${issueId}`);
 }
 
 // ---------------------------------------------------------------------------
