@@ -406,7 +406,7 @@ async function handleSlashCommand(
     case "companies":
       return handleCompanies(ctx);
     case "projects":
-      return handleProjects(ctx, companyId, getOption(subcommand.options ?? [], "company"), cmdCtx?.baseUrl);
+      return handleProjects(ctx, companyId, getOption(subcommand.options ?? [], "company"));
     case "help":
       return handleHelp();
     case "connect":
@@ -467,13 +467,7 @@ async function handleAutocomplete(
       const companyId = cmdCtx?.pluginCtx
         ? await resolveCompanyId(cmdCtx.pluginCtx)
         : (cmdCtx?.companyId ?? "default");
-      const base = cmdCtx?.baseUrl ?? "http://localhost:3100";
-      const resp = await paperclipFetch(
-        `${base}/api/companies/${companyId}/projects`,
-        { method: "GET" },
-      );
-      if (!resp.ok) return { type: 8, data: { choices: [] } };
-      const projects = (await resp.json()) as Array<{ id: string; name?: string }>;
+      const projects = await ctx.projects.list({ companyId, limit: 100 });
       const filtered = projects
         .filter((p) => {
           const name = (p.name ?? p.id).toLowerCase();
@@ -839,7 +833,6 @@ async function handleProjects(
   ctx: PluginContext,
   companyId: string,
   companyFilter?: string,
-  baseUrl?: string,
 ): Promise<unknown> {
   try {
     let resolvedCompanyId = companyId;
@@ -863,22 +856,10 @@ async function handleProjects(
       companyLabel = match.name ?? match.id;
     }
 
-    const base = baseUrl ?? "http://localhost:3100";
-    const resp = await withRetry(async () => {
-      const r = await paperclipFetch(
-        `${base}/api/companies/${resolvedCompanyId}/projects`,
-        { method: "GET" },
-      );
-      throwOnRetryableStatus(r);
-      return r;
-    });
-
-    if (!resp.ok) {
-      const body = await resp.text().catch(() => "");
-      throw new Error(`API ${resp.status}: ${body}`);
-    }
-
-    const projects = (await resp.json()) as Array<{
+    const projects = (await ctx.projects.list({
+      companyId: resolvedCompanyId,
+      limit: 100,
+    })) as Array<{
       id: string;
       name?: string;
       status?: string;

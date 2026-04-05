@@ -34,6 +34,9 @@ function makeCtx(overrides: Record<string, unknown> = {}) {
     companies: {
       list: vi.fn().mockResolvedValue([]),
     },
+    projects: {
+      list: vi.fn().mockResolvedValue([]),
+    },
     state: {
       get: vi.fn().mockResolvedValue(null),
       set: vi.fn().mockResolvedValue(undefined),
@@ -753,17 +756,11 @@ describe("/clip companies", () => {
 
 describe("/clip projects", () => {
   it("lists projects for the default company", async () => {
-    mockPaperclipFetch.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      headers: new Headers(),
-      json: () => Promise.resolve([
-        { id: "p1", name: "Project Alpha", status: "in_progress" },
-        { id: "p2", name: "Project Beta", status: "completed" },
-      ]),
-    });
-
     const ctx = makeCtx();
+    ctx.projects.list = vi.fn().mockResolvedValue([
+      { id: "p1", name: "Project Alpha", status: "in_progress" },
+      { id: "p2", name: "Project Beta", status: "completed" },
+    ]);
     const result = await handleInteraction(
       ctx,
       { type: 2, data: { name: "clip", options: [{ name: "projects" }] } },
@@ -776,22 +773,10 @@ describe("/clip projects", () => {
     expect(embed.description).toContain("Project Alpha");
     expect(embed.description).toContain("Project Beta");
     expect(embed.description).toContain("In Progress");
-    expect(mockPaperclipFetch).toHaveBeenCalledWith(
-      "http://localhost:3100/api/companies/default/projects",
-      expect.objectContaining({ method: "GET" }),
-    );
+    expect(ctx.projects.list).toHaveBeenCalledWith({ companyId: "default", limit: 100 });
   });
 
   it("filters by company name", async () => {
-    mockPaperclipFetch.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      headers: new Headers(),
-      json: () => Promise.resolve([
-        { id: "p1", name: "My Project", status: "in_progress" },
-      ]),
-    });
-
     const ctx = makeCtx({
       companies: {
         list: vi.fn().mockResolvedValue([
@@ -800,6 +785,9 @@ describe("/clip projects", () => {
         ]),
       },
     });
+    ctx.projects.list = vi.fn().mockResolvedValue([
+      { id: "p1", name: "My Project", status: "in_progress" },
+    ]);
 
     const result = await handleInteraction(
       ctx,
@@ -812,10 +800,7 @@ describe("/clip projects", () => {
 
     expect(result.type).toBe(4);
     expect(result.data.embeds[0].title).toBe("Projects (Acme)");
-    expect(mockPaperclipFetch).toHaveBeenCalledWith(
-      "http://localhost:3100/api/companies/c1/projects",
-      expect.objectContaining({ method: "GET" }),
-    );
+    expect(ctx.projects.list).toHaveBeenCalledWith({ companyId: "c1", limit: 100 });
   });
 
   it("returns error for unknown company filter", async () => {
@@ -841,14 +826,8 @@ describe("/clip projects", () => {
   });
 
   it("handles no projects found", async () => {
-    mockPaperclipFetch.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      headers: new Headers(),
-      json: () => Promise.resolve([]),
-    });
-
     const ctx = makeCtx();
+    ctx.projects.list = vi.fn().mockResolvedValue([]);
     const result = await handleInteraction(
       ctx,
       { type: 2, data: { name: "clip", options: [{ name: "projects" }] } },
@@ -858,15 +837,9 @@ describe("/clip projects", () => {
     expect(result.data.content).toContain("No projects found");
   });
 
-  it("handles API error gracefully", async () => {
-    mockPaperclipFetch.mockResolvedValueOnce({
-      ok: false,
-      status: 500,
-      headers: new Headers(),
-      text: () => Promise.resolve("Internal Server Error"),
-    });
-
+  it("handles project client error gracefully", async () => {
     const ctx = makeCtx();
+    ctx.projects.list = vi.fn().mockRejectedValue(new Error("Unauthorized"));
     const result = await handleInteraction(
       ctx,
       { type: 2, data: { name: "clip", options: [{ name: "projects" }] } },
@@ -991,18 +964,12 @@ describe("autocomplete (interaction type 4)", () => {
   });
 
   it("returns project suggestions for project autocomplete", async () => {
-    mockPaperclipFetch.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      headers: new Headers(),
-      json: () => Promise.resolve([
-        { id: "p1", name: "Frontend" },
-        { id: "p2", name: "Backend" },
-        { id: "p3", name: "Infra" },
-      ]),
-    });
-
     const ctx = makeCtx();
+    ctx.projects.list = vi.fn().mockResolvedValue([
+      { id: "p1", name: "Frontend" },
+      { id: "p2", name: "Backend" },
+      { id: "p3", name: "Infra" },
+    ]);
     const result = await handleInteraction(
       ctx,
       {
