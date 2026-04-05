@@ -45,6 +45,59 @@ describe("connectGateway", () => {
     expect(handler).not.toHaveBeenCalled();
     result.close(); // should not throw
   });
+
+  it("uses guild-only intents when message subscriptions are disabled", async () => {
+    class FakeWebSocket {
+      static instances: FakeWebSocket[] = [];
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: ((event: { code: number; reason: string }) => void) | null = null;
+      onerror: (() => void) | null = null;
+      sent: string[] = [];
+
+      constructor(_url: string) {
+        FakeWebSocket.instances.push(this);
+      }
+
+      send(payload: string) {
+        this.sent.push(payload);
+      }
+
+      close() {}
+    }
+
+    globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+
+    const { connectGateway } = await import("../src/gateway.js");
+    const ctx = makeCtx();
+    (ctx.http.fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      json: async () => ({ url: "wss://gateway.discord.test" }),
+    });
+
+    const result = await connectGateway(ctx, "fake-token", vi.fn(), undefined, {
+      listenForMessages: false,
+      includeMessageContent: false,
+    });
+
+    const socket = FakeWebSocket.instances[0];
+    expect(socket).toBeDefined();
+
+    socket.onmessage?.({
+      data: JSON.stringify({
+        op: 10,
+        d: { heartbeat_interval: 10000 },
+        s: null,
+        t: null,
+      }),
+    });
+
+    const identify = JSON.parse(socket.sent[0] ?? "{}");
+    expect(identify.op).toBe(2);
+    expect(identify.d.intents).toBe(1);
+
+    result.close();
+  });
 });
 
 describe("respondViaCallback", () => {

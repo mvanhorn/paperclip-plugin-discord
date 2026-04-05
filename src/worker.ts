@@ -253,6 +253,13 @@ const plugin = definePlugin({
       }
     }
 
+    const gatewayNeedsMessages =
+      config.enableInbound !== false ||
+      config.enableMediaPipeline === true ||
+      config.enableCustomCommands === true ||
+      config.enableProactiveSuggestions === true ||
+      config.enableIntelligence === true;
+
     // --- Gateway connection for real-time interaction handling ---
     const gateway = await connectGateway(
       ctx,
@@ -260,7 +267,11 @@ const plugin = definePlugin({
       async (interaction) => {
         return handleInteraction(ctx, interaction as any, cmdCtx);
       },
-      handleMessageCreate,
+      gatewayNeedsMessages ? handleMessageCreate : undefined,
+      {
+        listenForMessages: gatewayNeedsMessages,
+        includeMessageContent: gatewayNeedsMessages,
+      },
     );
 
     ctx.events.on("plugin.stopping", async () => {

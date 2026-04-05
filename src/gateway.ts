@@ -6,6 +6,9 @@ const GATEWAY_ENCODING = "json";
 const MAX_CONSECUTIVE_FAILURES = 5;
 const MAX_BACKOFF_MS = 60_000;
 const DEFAULT_RECONNECT_MS = 5000;
+const GUILD_INTENT = 1;
+const GUILD_MESSAGES_INTENT = 512;
+const MESSAGE_CONTENT_INTENT = 32768;
 
 interface GatewayPayload {
   op: number;
@@ -44,6 +47,11 @@ export interface MessageCreateEvent {
 type InteractionHandler = (interaction: InteractionCreateEvent) => Promise<unknown>;
 type MessageHandler = (message: MessageCreateEvent) => Promise<void>;
 
+export interface GatewayOptions {
+  listenForMessages?: boolean;
+  includeMessageContent?: boolean;
+}
+
 export async function respondViaCallback(
   ctx: PluginContext,
   interactionId: string,
@@ -81,6 +89,7 @@ export async function connectGateway(
   token: string,
   onInteraction: InteractionHandler,
   onMessage?: MessageHandler,
+  options: GatewayOptions = {},
 ): Promise<{ close: () => void }> {
   if (typeof WebSocket === "undefined") {
     ctx.logger.warn(
@@ -105,6 +114,12 @@ export async function connectGateway(
   let closed = false;
   let consecutiveFailures = 0;
   let lastHeartbeatIntervalMs = 41250;
+  const listenForMessages = options.listenForMessages ?? Boolean(onMessage);
+  const includeMessageContent = options.includeMessageContent ?? listenForMessages;
+  const intents =
+    GUILD_INTENT |
+    (listenForMessages ? GUILD_MESSAGES_INTENT : 0) |
+    (includeMessageContent ? MESSAGE_CONTENT_INTENT : 0);
 
   function getReconnectDelay(): number {
     if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
@@ -148,7 +163,7 @@ export async function connectGateway(
               op: 2,
               d: {
                 token: `Bot ${token}`,
-                intents: 1 | 512 | 32768, // GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT
+                intents,
                 properties: {
                   os: "linux",
                   browser: "paperclip-plugin-discord",
