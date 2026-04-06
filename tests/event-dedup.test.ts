@@ -271,6 +271,80 @@ describe("event deduplication", () => {
     expect(summaryField.value).toContain("Shipped and verified");
   });
 
+  it("issue.updated (done): resolves company before enriching when event companyId is missing", async () => {
+    const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext({
+      notifyOnIssueDone: true,
+    });
+    ctx.companies.list = vi.fn().mockResolvedValue([
+      { id: "company-1", name: "Primary" },
+      { id: "company-2", name: "ProbeCo" },
+    ]);
+    ctx.issues.get = vi.fn().mockImplementation(async (_issueId: string, companyId: string) => {
+      if (companyId !== "company-2") return null;
+      return {
+        id: "entity-1",
+        identifier: "TST-4",
+        title: "Completed issue",
+        status: "done",
+        completedAt: "2026-04-05T12:00:00Z",
+      };
+    });
+    ctx.issues.listComments.mockResolvedValue([
+      {
+        body: "Recovered by company scan.",
+        authorUserId: "discord:alice",
+        createdAt: "2026-04-05T12:01:00Z",
+      },
+    ]);
+    await getSetup()(ctx);
+
+    const event = makeEvent("issue.updated", "evt-done-missing-company", {
+      status: "done",
+    });
+    delete event.companyId;
+
+    await emitEvent(eventHandlers, "issue.updated", event);
+
+    const requestBody = JSON.parse(mockDiscordFetch.mock.calls[0][1].body);
+    const embed = requestBody.embeds[0];
+    const completedByField = embed.fields.find((f: { name: string }) => f.name === "Completed by");
+    const summaryField = embed.fields.find((f: { name: string }) => f.name === "Summary");
+    expect(completedByField.value).toBe("alice");
+    expect(summaryField.value).toContain("Recovered by company scan");
+  });
+
+  it("issue.updated (done): humanizes non-Discord board users in completion field", async () => {
+    const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext({
+      notifyOnIssueDone: true,
+    });
+    ctx.issues.get.mockResolvedValue({
+      id: "entity-1",
+      identifier: "TST-5",
+      title: "Completed issue",
+      status: "done",
+      completedAt: "2026-04-05T12:00:00Z",
+    });
+    ctx.issues.listComments.mockResolvedValue([
+      {
+        body: "Completed by a board user.",
+        authorUserId: "J5BkUUyLG8iYyiLF2brqFsPZJNsgYSkz",
+        createdAt: "2026-04-05T12:01:00Z",
+      },
+    ]);
+    await getSetup()(ctx);
+
+    const event = makeEvent("issue.updated", "evt-done-board-user", {
+      status: "done",
+    });
+
+    await emitEvent(eventHandlers, "issue.updated", event);
+
+    const requestBody = JSON.parse(mockDiscordFetch.mock.calls[0][1].body);
+    const embed = requestBody.embeds[0];
+    const completedByField = embed.fields.find((f: { name: string }) => f.name === "Completed by");
+    expect(completedByField.value).toBe("Board user");
+  });
+
   it("approval.created: first delivery posts, duplicate is skipped", async () => {
     const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext({
       notifyOnApprovalCreated: true,

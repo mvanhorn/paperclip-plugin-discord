@@ -129,7 +129,10 @@ async function enrichIssueNotificationPayload(
   if (event.entityType !== "issue" || !event.entityId) return payload;
 
   try {
-    const issue = await ctx.issues.get(event.entityId, event.companyId) as {
+    const companyId = await resolveIssueCompanyIdForNotification(ctx, event, payload);
+    if (!companyId) return payload;
+
+    const issue = await ctx.issues.get(event.entityId, companyId) as {
       id: string;
       identifier?: string | null;
       title?: string | null;
@@ -159,7 +162,7 @@ async function enrichIssueNotificationPayload(
     }
 
     if (String(payload.status ?? "") === "done") {
-      const comments = await ctx.issues.listComments(event.entityId, event.companyId) as Array<{
+      const comments = await ctx.issues.listComments(event.entityId, companyId) as Array<{
         authorAgentId?: string | null;
         authorUserId?: string | null;
         body: string;
@@ -174,12 +177,24 @@ async function enrichIssueNotificationPayload(
         })[0];
         if (payload.lastComment == null) payload.lastComment = lastComment.body;
         if (payload.completedBy == null) {
-          payload.completedBy = lastComment.authorUserId || lastComment.authorAgentId || null;
+          if (lastComment.authorUserId) {
+            payload.completedBy = lastComment.authorUserId.startsWith("discord:")
+              ? lastComment.authorUserId
+              : "Board user";
+          } else if (lastComment.authorAgentId) {
+            payload.completedBy = payload.agentName ?? "Agent";
+          }
         }
       }
 
       if (payload.completedBy == null) {
-        payload.completedBy = payload.assigneeUserId ?? payload.assigneeAgentId ?? payload.agentName ?? null;
+        if (typeof payload.assigneeUserId === "string") {
+          payload.completedBy = payload.assigneeUserId.startsWith("discord:")
+            ? payload.assigneeUserId
+            : "Board user";
+        } else {
+          payload.completedBy = payload.agentName ?? payload.assigneeAgentId ?? null;
+        }
       }
     }
   } catch (error) {
@@ -190,6 +205,30 @@ async function enrichIssueNotificationPayload(
   }
 
   return payload;
+}
+
+async function resolveIssueCompanyIdForNotification(
+  ctx: PluginContext,
+  event: PluginEvent,
+  payload: IssueNotificationPayload,
+): Promise<string | null> {
+  const candidates = [
+    typeof event.companyId === "string" ? event.companyId : null,
+    typeof payload.companyId === "string" ? payload.companyId : null,
+  ].filter((value): value is string => Boolean(value));
+
+  for (const companyId of candidates) {
+    const issue = await ctx.issues.get(event.entityId!, companyId);
+    if (issue) return companyId;
+  }
+
+  const companies = await ctx.companies.list();
+  for (const company of companies) {
+    const issue = await ctx.issues.get(event.entityId!, company.id);
+    if (issue) return company.id;
+  }
+
+  return candidates[0] ?? null;
 }
 
 const plugin = definePlugin({
