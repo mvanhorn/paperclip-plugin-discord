@@ -31,9 +31,19 @@ export function humanizePriority(raw: string): string {
   return PRIORITY_LABELS[raw] ?? raw;
 }
 
-function resolveBaseUrl(baseUrl?: string): string {
-  const url = baseUrl || DEFAULT_BASE_URL;
-  return url.endsWith("/") ? url.slice(0, -1) : url;
+function resolveBaseUrl(baseUrl?: string): string | null {
+  const url = (baseUrl || DEFAULT_BASE_URL).trim();
+  const normalized = url.endsWith("/") ? url.slice(0, -1) : url;
+
+  try {
+    const parsed = new URL(normalized);
+    if (["localhost", "127.0.0.1", "::1", "[::1]"].includes(parsed.hostname)) {
+      return null;
+    }
+    return normalized;
+  } catch {
+    return null;
+  }
 }
 
 export function formatIssueCreated(event: PluginEvent, baseUrl?: string): DiscordMessage {
@@ -76,23 +86,17 @@ export function formatIssueCreated(event: PluginEvent, baseUrl?: string): Discor
   }
 
   const base = resolveBaseUrl(baseUrl);
-  const dashboardUrl = `${base}/issues/${event.entityId}`;
 
   const footerParts: string[] = [];
   if (creatorName) footerParts.push(`Created by ${creatorName}`);
   if (projectName) footerParts.push(projectName);
   const footerText = footerParts.length > 0 ? footerParts.join(" • ") : "Paperclip";
 
-  const buttons: DiscordComponent[] = [
-    {
-      type: 2,
-      style: 1,
-      label: "Assign to Me",
-      custom_id: `issue_assign_${event.entityId}`,
-    },
-    { type: 2, style: 5, label: "View Issue", url: dashboardUrl },
-  ];
-  if (parentId) {
+  const buttons: DiscordComponent[] = [];
+  if (base) {
+    buttons.push({ type: 2, style: 5, label: "View Issue", url: `${base}/issues/${event.entityId}` });
+  }
+  if (base && parentId) {
     buttons.push({
       type: 2,
       style: 5,
@@ -114,7 +118,7 @@ export function formatIssueCreated(event: PluginEvent, baseUrl?: string): Discor
         timestamp: event.occurredAt,
       },
     ],
-    components: [{ type: 1, components: buttons }],
+    components: buttons.length > 0 ? [{ type: 1, components: buttons }] : [],
   };
 }
 
@@ -148,11 +152,11 @@ export function formatIssueDone(event: PluginEvent, baseUrl?: string): DiscordMe
   }
 
   const base = resolveBaseUrl(baseUrl);
-  const dashboardUrl = `${base}/issues/${event.entityId}`;
 
-  const buttons: DiscordComponent[] = [
-    { type: 2, style: 5, label: "View Issue", url: dashboardUrl },
-  ];
+  const buttons: DiscordComponent[] = [];
+  if (base) {
+    buttons.push({ type: 2, style: 5, label: "View Issue", url: `${base}/issues/${event.entityId}` });
+  }
   if (p.prUrl) {
     buttons.push({ type: 2, style: 5, label: "View Diff", url: String(p.prUrl) });
   }
@@ -186,7 +190,7 @@ export function formatApprovalCreated(event: PluginEvent, baseUrl?: string): Dis
   const description = String(p.description ?? "");
   const agentName = String(p.agentName ?? "");
   const issueIds = Array.isArray(p.issueIds) ? p.issueIds as string[] : [];
-  const dashboardUrl = `${resolveBaseUrl(baseUrl)}/approvals/${approvalId}`;
+  const dashboardBase = resolveBaseUrl(baseUrl);
 
   const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
   if (agentName) fields.push({ name: "Agent", value: agentName, inline: true });
@@ -246,12 +250,14 @@ export function formatApprovalCreated(event: PluginEvent, baseUrl?: string): Dis
             label: "Reject",
             custom_id: `approval_reject_${approvalId}`,
           },
-          {
-            type: 2,
-            style: 5,
-            label: "View",
-            url: dashboardUrl,
-          },
+          ...(dashboardBase
+            ? [{
+                type: 2,
+                style: 5,
+                label: "View",
+                url: `${dashboardBase}/approvals/${approvalId}`,
+              } satisfies DiscordComponent]
+            : []),
         ],
       },
     ],

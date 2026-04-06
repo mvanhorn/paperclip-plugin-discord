@@ -59,10 +59,10 @@ describe("formatIssueCreated", () => {
     expect(viewBtn?.url).toBe("https://app.paperclip.dev/issues/iss-1");
   });
 
-  it("uses default base URL when none provided", () => {
+  it("omits View Issue button when base URL is omitted", () => {
     const msg = formatIssueCreated(makeEvent({ entityId: "iss-1" }));
     const viewBtn = msg.components?.[0]?.components?.find((c) => c.label === "View Issue");
-    expect(viewBtn?.url).toBe("http://localhost:3100/issues/iss-1");
+    expect(viewBtn).toBeUndefined();
   });
 });
 
@@ -112,11 +112,12 @@ describe("formatIssueDone", () => {
 });
 
 describe("formatApprovalCreated", () => {
-  it("includes interactive approve/reject/view buttons", () => {
+  it("includes interactive approve/reject/view buttons when baseUrl is provided", () => {
     const msg = formatApprovalCreated(
       makeEvent({
         payload: { type: "strategy", approvalId: "apr-123", issueIds: ["i1"] },
       }),
+      "https://app.paperclip.dev",
     );
     expect(msg.embeds?.[0]?.color).toBe(COLORS.YELLOW);
     expect(msg.components).toHaveLength(1);
@@ -266,13 +267,13 @@ describe("agent label formatting", () => {
 });
 
 describe("escalation embed structure", () => {
-  it("approval created embed has action row with 3 buttons", () => {
+  it("approval created embed has action row with 2 buttons when baseUrl is omitted", () => {
     const msg = formatApprovalCreated(
       makeEvent({ payload: { approvalId: "apr-1" } }),
     );
     expect(msg.components).toHaveLength(1);
     expect(msg.components?.[0]?.type).toBe(1); // action row
-    expect(msg.components?.[0]?.components).toHaveLength(3);
+    expect(msg.components?.[0]?.components).toHaveLength(2);
   });
 
   it("approve button uses style 3 (success/green)", () => {
@@ -293,9 +294,10 @@ describe("escalation embed structure", () => {
     expect(rejectBtn?.label).toBe("Reject");
   });
 
-  it("view button uses style 5 (link)", () => {
+  it("view button uses style 5 (link) when baseUrl is provided", () => {
     const msg = formatApprovalCreated(
       makeEvent({ payload: { approvalId: "apr-1" } }),
+      "https://app.paperclip.dev",
     );
     const viewBtn = msg.components?.[0]?.components?.[2];
     expect(viewBtn?.style).toBe(5);
@@ -313,22 +315,21 @@ describe("approval View button URL uses configured base URL", () => {
     expect(viewBtn?.url).toBe("https://app.paperclip.ing/approvals/apr-99");
   });
 
-  it("falls back to DEFAULT_BASE_URL when baseUrl is undefined", () => {
+  it("omits View button when baseUrl is undefined", () => {
     const msg = formatApprovalCreated(
       makeEvent({ payload: { approvalId: "apr-99" } }),
     );
     const viewBtn = msg.components?.[0]?.components?.[2];
-    expect(viewBtn?.url).toBe("http://localhost:3100/approvals/apr-99");
+    expect(viewBtn).toBeUndefined();
   });
 
-  it("falls back to DEFAULT_BASE_URL when baseUrl is empty string", () => {
+  it("omits View button when baseUrl is empty string", () => {
     const msg = formatApprovalCreated(
       makeEvent({ payload: { approvalId: "apr-99" } }),
       "",
     );
     const viewBtn = msg.components?.[0]?.components?.[2];
-    // Empty string is falsy but not nullish — should still fall back
-    expect(viewBtn?.url).toBe("http://localhost:3100/approvals/apr-99");
+    expect(viewBtn).toBeUndefined();
   });
 
   it("strips trailing slash from baseUrl to avoid double-slash", () => {
@@ -413,14 +414,12 @@ describe("humanized status and priority in issue embeds", () => {
 });
 
 describe("formatIssueCreated — actionability improvements", () => {
-  it("includes Assign to Me button with correct custom_id", () => {
+  it("does not include Assign to Me button", () => {
     const msg = formatIssueCreated(
       makeEvent({ entityId: "iss-99", payload: { identifier: "X-1", title: "Task" } }),
     );
     const assignBtn = msg.components?.[0]?.components?.find((c) => c.label === "Assign to Me");
-    expect(assignBtn).toBeDefined();
-    expect(assignBtn?.style).toBe(1); // blurple/primary
-    expect(assignBtn?.custom_id).toBe("issue_assign_iss-99");
+    expect(assignBtn).toBeUndefined();
   });
 
   it("shows parent context field when parentIdentifier is provided", () => {
@@ -550,13 +549,22 @@ describe("formatIssueDone — actionability improvements", () => {
     expect(diffBtn).toBeUndefined();
   });
 
-  it("always includes View Issue button", () => {
+  it("includes View Issue button when base URL is provided", () => {
     const msg = formatIssueDone(
       makeEvent({ entityId: "iss-7", payload: { identifier: "X-7", title: "T" } }),
+      "https://paperclip.example.com",
     );
     const viewBtn = msg.components?.[0]?.components?.find((c) => c.label === "View Issue");
     expect(viewBtn).toBeDefined();
-    expect(viewBtn?.url).toBe("http://localhost:3100/issues/iss-7");
+    expect(viewBtn?.url).toBe("https://paperclip.example.com/issues/iss-7");
+  });
+
+  it("omits View Issue button when base URL resolves to localhost", () => {
+    const msg = formatIssueDone(
+      makeEvent({ entityId: "iss-8", payload: { identifier: "X-8", title: "T" } }),
+    );
+    const viewBtn = msg.components?.[0]?.components?.find((c) => c.label === "View Issue");
+    expect(viewBtn).toBeUndefined();
   });
 
   it("falls back to executorName when assigneeName is missing", () => {
