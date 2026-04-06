@@ -125,10 +125,14 @@ export function formatIssueDone(event: PluginEvent, baseUrl?: string): DiscordMe
   const status = p.status ? String(p.status) : null;
   const priority = p.priority ? String(p.priority) : null;
   const assigneeName = p.assigneeName ? String(p.assigneeName) : null;
+  const assigneeUserId = p.assigneeUserId ? String(p.assigneeUserId) : null;
   const executorName = p.executorName ? String(p.executorName) : null;
   const agentName = p.agentName ? String(p.agentName) : null;
+  const explicitCompletedBy = p.completedBy ? String(p.completedBy) : null;
   const assigneeAgentId = p.assigneeAgentId ? String(p.assigneeAgentId) : null;
-  const completedBy = assigneeName || executorName || agentName || assigneeAgentId || "Unknown";
+  const completedBy = humanizeActorLabel(
+    explicitCompletedBy || assigneeName || executorName || agentName || assigneeUserId || assigneeAgentId,
+  ) || "Unknown";
   const lastComment = p.lastComment ? String(p.lastComment) : null;
   const summary = lastComment ? lastComment.slice(0, 200) : "No summary available";
   const parentIdentifier = p.parentIdentifier ? String(p.parentIdentifier) : null;
@@ -176,6 +180,14 @@ export function formatIssueDone(event: PluginEvent, baseUrl?: string): DiscordMe
     ],
     components: [{ type: 1, components: buttons }],
   };
+}
+
+function humanizeActorLabel(value: string | null): string | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith("discord:")) return trimmed.slice("discord:".length);
+  return trimmed;
 }
 
 export function formatApprovalCreated(event: PluginEvent, baseUrl?: string): DiscordMessage {

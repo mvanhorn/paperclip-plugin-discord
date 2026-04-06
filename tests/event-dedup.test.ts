@@ -36,6 +36,7 @@ function getSetup(): (ctx: any) => Promise<void> {
 function buildPluginContext(configOverrides: Record<string, unknown> = {}) {
   const eventHandlers = new Map<string, Array<(event: any) => Promise<void>>>();
   let discordMessageCount = 0;
+  const stateStore = new Map<string, unknown>();
 
   const defaultConfig: Record<string, unknown> = {
     discordBotTokenRef: "fake-secret-ref",
@@ -89,8 +90,14 @@ function buildPluginContext(configOverrides: Record<string, unknown> = {}) {
       debug: vi.fn(),
     },
     state: {
-      get: vi.fn().mockResolvedValue(null),
-      set: vi.fn().mockResolvedValue(undefined),
+      get: vi.fn().mockImplementation(async (key: { scopeKind: string; scopeId?: string; stateKey: string }) => {
+        const id = `${key.scopeKind}:${key.scopeId ?? ""}:${key.stateKey}`;
+        return stateStore.get(id) ?? null;
+      }),
+      set: vi.fn().mockImplementation(async (key: { scopeKind: string; scopeId?: string; stateKey: string }, value: unknown) => {
+        const id = `${key.scopeKind}:${key.scopeId ?? ""}:${key.stateKey}`;
+        stateStore.set(id, value);
+      }),
     },
     metrics: { write: vi.fn().mockResolvedValue(undefined) },
     activity: { log: vi.fn().mockResolvedValue(undefined) },
@@ -114,7 +121,11 @@ function buildPluginContext(configOverrides: Record<string, unknown> = {}) {
     },
     companies: { list: vi.fn().mockResolvedValue([]) },
     agents: { list: vi.fn().mockResolvedValue([]), invoke: vi.fn() },
-    issues: { list: vi.fn().mockResolvedValue([]) },
+    issues: {
+      list: vi.fn().mockResolvedValue([]),
+      get: vi.fn().mockResolvedValue(null),
+      listComments: vi.fn().mockResolvedValue([]),
+    },
     http: {
       fetch: mockDiscordFetch,
     },
@@ -202,6 +213,13 @@ describe("event deduplication", () => {
     const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext({
       notifyOnIssueDone: true,
     });
+    ctx.issues.get.mockResolvedValue({
+      id: "entity-1",
+      identifier: "TST-2",
+      title: "Completed issue",
+      status: "done",
+      completedAt: "2026-04-05T12:00:00Z",
+    });
     await getSetup()(ctx);
 
     const event = makeEvent("issue.updated", "evt-done-1", {
@@ -216,6 +234,41 @@ describe("event deduplication", () => {
 
     await emitEvent(eventHandlers, "issue.updated", event);
     expect(mockDiscordFetch.mock.calls.length).toBe(firstCallCount);
+  });
+
+  it("issue.updated (done): enriches completed-by and summary from issue comments", async () => {
+    const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext({
+      notifyOnIssueDone: true,
+    });
+    ctx.issues.get.mockResolvedValue({
+      id: "entity-1",
+      identifier: "TST-3",
+      title: "Completed issue",
+      status: "done",
+      completedAt: "2026-04-05T12:00:00Z",
+      assigneeUserId: "discord:alice",
+    });
+    ctx.issues.listComments.mockResolvedValue([
+      {
+        body: "Shipped and verified in production.",
+        authorUserId: "discord:alice",
+        createdAt: "2026-04-05T12:01:00Z",
+      },
+    ]);
+    await getSetup()(ctx);
+
+    const event = makeEvent("issue.updated", "evt-done-enriched", {
+      status: "done",
+    });
+
+    await emitEvent(eventHandlers, "issue.updated", event);
+
+    const requestBody = JSON.parse(mockDiscordFetch.mock.calls[0][1].body);
+    const embed = requestBody.embeds[0];
+    const completedByField = embed.fields.find((f: { name: string }) => f.name === "Completed by");
+    const summaryField = embed.fields.find((f: { name: string }) => f.name === "Summary");
+    expect(completedByField.value).toBe("alice");
+    expect(summaryField.value).toContain("Shipped and verified");
   });
 
   it("approval.created: first delivery posts, duplicate is skipped", async () => {

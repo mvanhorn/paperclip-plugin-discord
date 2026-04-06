@@ -608,6 +608,22 @@ describe("formatIssueDone — actionability improvements", () => {
     const field = msg.embeds?.[0]?.fields?.find((f) => f.name === "Completed by");
     expect(field?.value).toBe("Engineer");
   });
+
+  it("uses explicit completedBy when provided", () => {
+    const msg = formatIssueDone(
+      makeEvent({ payload: { identifier: "X-14", title: "T", completedBy: "discord:alice" } }),
+    );
+    const field = msg.embeds?.[0]?.fields?.find((f) => f.name === "Completed by");
+    expect(field?.value).toBe("alice");
+  });
+
+  it("falls back to assigneeUserId when assigneeName is missing", () => {
+    const msg = formatIssueDone(
+      makeEvent({ payload: { identifier: "X-15", title: "T", assigneeUserId: "discord:bob" } }),
+    );
+    const field = msg.embeds?.[0]?.fields?.find((f) => f.name === "Completed by");
+    expect(field?.value).toBe("bob");
+  });
 });
 
 // ---------------------------------------------------------------------------
