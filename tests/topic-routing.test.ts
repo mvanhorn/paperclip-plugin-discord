@@ -30,6 +30,7 @@ function getSetup(): (ctx: any) => Promise<void> {
 
 function buildPluginContext(configOverrides: Record<string, unknown> = {}, stateOverrides: Record<string, unknown> = {}) {
   const eventHandlers = new Map<string, Array<(event: any) => Promise<void>>>();
+  const actionHandlers = new Map<string, (params: any) => Promise<any>>();
   let discordMessageCount = 0;
 
   const defaultConfig: Record<string, unknown> = {
@@ -94,7 +95,11 @@ function buildPluginContext(configOverrides: Record<string, unknown> = {}, state
     jobs: { register: vi.fn() },
     tools: { register: vi.fn() },
     data: { register: vi.fn() },
-    actions: { register: vi.fn() },
+    actions: {
+      register: vi.fn().mockImplementation((name: string, fn: (params: any) => Promise<any>) => {
+        actionHandlers.set(name, fn);
+      }),
+    },
     events: {
       subscribe: vi.fn(),
       emit: vi.fn(),
@@ -107,11 +112,15 @@ function buildPluginContext(configOverrides: Record<string, unknown> = {}, state
     },
     companies: { list: vi.fn().mockResolvedValue([]) },
     agents: { list: vi.fn().mockResolvedValue([]), invoke: vi.fn() },
-    issues: { list: vi.fn().mockResolvedValue([]) },
+    issues: {
+      list: vi.fn().mockResolvedValue([]),
+      get: vi.fn().mockResolvedValue(null),
+      listComments: vi.fn().mockResolvedValue([]),
+    },
     http: { fetch: mockDiscordFetch },
   } as any;
 
-  return { ctx, eventHandlers, mockDiscordFetch };
+  return { ctx, eventHandlers, actionHandlers, mockDiscordFetch };
 }
 
 function makeEvent(eventType: string, eventId: string, payload: Record<string, unknown> = {}): any {
@@ -252,5 +261,62 @@ describe("topic routing", () => {
     );
     expect(postCall).toBeDefined();
     expect(postCall![0]).toContain("ch-default");
+  });
+
+  it("enriches issue.created before topic routing so issue project names can map to a topic channel", async () => {
+    const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext(
+      { topicRouting: true, notifyOnIssueCreated: true },
+      { "channel-project-map": { "my-project": "1492469315486748802" } },
+    );
+    ctx.issues.get = vi.fn().mockResolvedValue({
+      id: "entity-1",
+      identifier: "TST-6",
+      title: "Created issue",
+      status: "todo",
+      project: { name: "my-project" },
+    });
+
+    await getSetup()(ctx);
+
+    const event = makeEvent("issue.created", "evt-topic-6", {
+      title: "Created issue",
+      identifier: "TST-6",
+    });
+
+    await emitEvent(eventHandlers, "issue.created", event);
+
+    const postCall = mockDiscordFetch.mock.calls.find(
+      (call: any[]) => typeof call[0] === "string" && call[0].includes("/channels/"),
+    );
+    expect(postCall).toBeDefined();
+    expect(postCall![0]).toContain("1492469315486748802");
+  });
+
+  it("rejects non-string set-channel inputs so truncated numeric snowflakes cannot be stored", async () => {
+    const { ctx, actionHandlers } = buildPluginContext();
+    await getSetup()(ctx);
+
+    const setChannel = actionHandlers.get("set-channel");
+    expect(setChannel).toBeDefined();
+
+    const numericResult = await setChannel!({
+      companyId: "company-1",
+      channelId: 1492469315486748802,
+    });
+    expect(numericResult).toEqual({
+      ok: false,
+      error: "Invalid channel ID - must be a snowflake string",
+    });
+    expect(ctx.state.set).not.toHaveBeenCalled();
+
+    const validResult = await setChannel!({
+      companyId: "company-1",
+      channelId: "1492469315486748802",
+    });
+    expect(validResult).toEqual({ ok: true });
+    expect(ctx.state.set).toHaveBeenCalledWith(
+      expect.objectContaining({ scopeKind: "company", scopeId: "company-1", stateKey: "discord-channel" }),
+      "1492469315486748802",
+    );
   });
 });

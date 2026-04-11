@@ -108,17 +108,32 @@ interface EscalationCreatedPayload {
   suggestedReply?: string;
 }
 
+const SNOWFLAKE_ID_REGEX = /^\d{17,20}$/;
+
+function normalizeDiscordId(value: unknown): string | null {
+  if (value == null) return null;
+  const normalized = String(value).trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function normalizeDiscordIdList(values: unknown): string[] {
+  if (!Array.isArray(values)) return [];
+  return values
+    .map((value) => normalizeDiscordId(value))
+    .filter((value): value is string => value !== null);
+}
+
 async function resolveChannel(
   ctx: PluginContext,
   companyId: string,
-  fallback: string,
+  fallback: unknown,
 ): Promise<string | null> {
   const override = await ctx.state.get({
     scopeKind: "company",
     scopeId: companyId,
     stateKey: "discord-channel",
   });
-  return (override as string) ?? fallback ?? null;
+  return normalizeDiscordId(override) ?? normalizeDiscordId(fallback);
 }
 
 async function enrichIssueNotificationPayload(
@@ -248,6 +263,13 @@ const plugin = definePlugin({
     const token = await ctx.secrets.resolve(config.discordBotTokenRef);
     const baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
     const retentionDays = config.intelligenceRetentionDays || 30;
+    const defaultGuildId = normalizeDiscordId(config.defaultGuildId);
+    const defaultChannelId = normalizeDiscordId(config.defaultChannelId) ?? "";
+    const approvalsChannelId = normalizeDiscordId(config.approvalsChannelId);
+    const errorsChannelId = normalizeDiscordId(config.errorsChannelId);
+    const bdPipelineChannelId = normalizeDiscordId(config.bdPipelineChannelId);
+    const escalationChannelId = normalizeDiscordId(config.escalationChannelId) ?? defaultChannelId;
+    const intelligenceChannelIds = normalizeDiscordIdList(config.intelligenceChannelIds);
 
     // Company ID is resolved lazily on first /clip command or job invocation,
     // NOT during setup — startup-time API calls can cause worker activation to fail.
@@ -257,7 +279,7 @@ const plugin = definePlugin({
       baseUrl,
       companyId,
       token,
-      defaultChannelId: config.defaultChannelId,
+      defaultChannelId,
       pluginCtx: ctx,
     };
 
@@ -266,14 +288,14 @@ const plugin = definePlugin({
     _cmdCtx = cmdCtx;
 
     // --- Register slash commands with Discord ---
-    if (config.defaultGuildId) {
+    if (defaultGuildId) {
       const appId = await getApplicationId(ctx, token);
       if (appId) {
         const registered = await registerSlashCommands(
           ctx,
           token,
           appId,
-          config.defaultGuildId,
+          defaultGuildId,
           SLASH_COMMANDS,
         );
         if (registered) {
@@ -436,7 +458,7 @@ const plugin = definePlugin({
         stateKey: "channel-project-map",
       })) as Record<string, string> | null;
 
-      return channelMap?.[projectName] ?? null;
+      return normalizeDiscordId(channelMap?.[projectName]) ?? null;
     };
 
     const notify = async (
@@ -480,9 +502,10 @@ const plugin = definePlugin({
     };
 
     if (config.notifyOnIssueCreated) {
-      ctx.events.on("issue.created", (event: PluginEvent) =>
-        notify(event, formatIssueCreated),
-      );
+      ctx.events.on("issue.created", async (event: PluginEvent) => {
+        const payload = await enrichIssueNotificationPayload(ctx, event);
+        await notify({ ...event, payload }, formatIssueCreated);
+      });
     }
 
     if (config.notifyOnIssueDone) {
@@ -513,21 +536,21 @@ const plugin = definePlugin({
 
     if (config.notifyOnApprovalCreated) {
       ctx.events.on("approval.created", (event: PluginEvent) =>
-        notify(event, formatApprovalCreated, config.approvalsChannelId),
+        notify(event, formatApprovalCreated, approvalsChannelId ?? undefined),
       );
     }
 
     if (config.notifyOnAgentError) {
       ctx.events.on("agent.run.failed", (event: PluginEvent) =>
-        notify(event, formatSessionFailure, config.errorsChannelId),
+        notify(event, formatSessionFailure, errorsChannelId ?? undefined),
       );
     }
 
     ctx.events.on("agent.run.started", (event: PluginEvent) =>
-      notify(event, formatAgentRunStarted, config.bdPipelineChannelId),
+      notify(event, formatAgentRunStarted, bdPipelineChannelId ?? undefined),
     );
     ctx.events.on("agent.run.finished", (event: PluginEvent) =>
-      notify(event, formatAgentRunFinished, config.bdPipelineChannelId),
+      notify(event, formatAgentRunFinished, bdPipelineChannelId ?? undefined),
     );
 
     // ===================================================================
@@ -535,7 +558,6 @@ const plugin = definePlugin({
     // ===================================================================
 
     const adapter = new DiscordAdapter(ctx, token);
-    const escalationChannelId = config.escalationChannelId || config.defaultChannelId;
     const escalationTimeoutMs = (config.escalationTimeoutMinutes || 30) * 60 * 1000;
 
     // Escalation state helpers are imported from ./escalation-state.js
@@ -916,7 +938,7 @@ const plugin = definePlugin({
         const channelId = await resolveChannel(
           ctx,
           jobCompanyId,
-          config.errorsChannelId || config.defaultChannelId,
+          errorsChannelId ?? defaultChannelId,
         );
         if (!channelId) continue;
 
@@ -1031,7 +1053,7 @@ const plugin = definePlugin({
         return;
       }
       const cid = await resolveCompanyId(ctx);
-      await checkWatches(ctx, token, cid, config.defaultChannelId);
+      await checkWatches(ctx, token, cid, defaultChannelId);
     });
 
     // ===================================================================
@@ -1071,7 +1093,7 @@ const plugin = definePlugin({
 
       const companies = await ctx.companies.list();
       for (const company of companies) {
-        const channelId = await resolveChannel(ctx, company.id, config.defaultChannelId);
+        const channelId = await resolveChannel(ctx, company.id, defaultChannelId);
         if (!channelId) continue;
 
         try {
@@ -1202,12 +1224,18 @@ const plugin = definePlugin({
         scopeId: cid,
         stateKey: "discord-channel",
       });
-      return { channelId: saved ?? config.defaultChannelId };
+      return { channelId: normalizeDiscordId(saved) ?? defaultChannelId };
     });
 
     ctx.actions.register("set-channel", async (params) => {
       const cid = String(params.companyId);
-      const channelId = String(params.channelId);
+      if (typeof params.channelId !== "string") {
+        return { ok: false, error: "Invalid channel ID - must be a snowflake string" };
+      }
+      const channelId = params.channelId.trim();
+      if (!SNOWFLAKE_ID_REGEX.test(channelId)) {
+        return { ok: false, error: "Invalid channel ID - must be a snowflake string" };
+      }
       await ctx.state.set(
         { scopeKind: "company", scopeId: cid, stateKey: "discord-channel" },
         channelId,
@@ -1259,7 +1287,7 @@ const plugin = definePlugin({
     // --- Intelligence: scheduled scan ---
 
     ctx.jobs.register("discord-intelligence-scan", async () => {
-      if (!config.enableIntelligence || !config.intelligenceChannelIds?.length) {
+      if (!config.enableIntelligence || intelligenceChannelIds.length === 0 || !defaultGuildId) {
         ctx.logger.debug("discord-intelligence-scan: intelligence disabled or no channels configured, skipping");
         return;
       }
@@ -1267,21 +1295,21 @@ const plugin = definePlugin({
       await runIntelligenceScan(
         ctx,
         token,
-        config.defaultGuildId,
-        config.intelligenceChannelIds,
+        defaultGuildId,
+        intelligenceChannelIds,
         cid,
         retentionDays,
       );
     });
-    if (config.enableIntelligence && config.intelligenceChannelIds.length > 0) {
+    if (config.enableIntelligence && intelligenceChannelIds.length > 0) {
       ctx.logger.info("Intelligence scan job registered", {
-        channels: config.intelligenceChannelIds.length,
+        channels: intelligenceChannelIds.length,
       });
     }
 
     // --- Backfill ---
 
-    if (config.enableIntelligence && config.intelligenceChannelIds.length > 0) {
+    if (config.enableIntelligence && intelligenceChannelIds.length > 0 && defaultGuildId) {
       // Backfill also deferred to avoid startup-time company resolution.
       // It runs as an async task after setup completes.
       const tryBackfill = async () => {
@@ -1297,8 +1325,8 @@ const plugin = definePlugin({
           await runBackfill(
             ctx,
             token,
-            config.defaultGuildId,
-            config.intelligenceChannelIds,
+            defaultGuildId,
+            intelligenceChannelIds,
             cid,
             config.backfillDays ?? 90,
           );
@@ -1316,8 +1344,8 @@ const plugin = definePlugin({
         const signals = await runBackfill(
           ctx,
           token,
-          config.defaultGuildId,
-          config.intelligenceChannelIds,
+          defaultGuildId,
+          intelligenceChannelIds,
           cid,
           config.backfillDays ?? 90,
         );

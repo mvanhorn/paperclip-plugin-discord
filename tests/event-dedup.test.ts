@@ -157,6 +157,16 @@ async function emitEvent(
   }
 }
 
+function findDiscordPostBody(mockDiscordFetch: ReturnType<typeof vi.fn>) {
+  const postCall = mockDiscordFetch.mock.calls.find(
+    (call: any[]) => typeof call[0] === "string" && call[0].includes("/channels/") && typeof call[1]?.body === "string",
+  );
+  if (!postCall) {
+    throw new Error("Expected a Discord channel POST with a JSON body");
+  }
+  return JSON.parse(postCall[1].body);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -263,7 +273,7 @@ describe("event deduplication", () => {
 
     await emitEvent(eventHandlers, "issue.updated", event);
 
-    const requestBody = JSON.parse(mockDiscordFetch.mock.calls[0][1].body);
+    const requestBody = findDiscordPostBody(mockDiscordFetch);
     const embed = requestBody.embeds[0];
     const completedByField = embed.fields.find((f: { name: string }) => f.name === "Completed by");
     const summaryField = embed.fields.find((f: { name: string }) => f.name === "Summary");
@@ -305,7 +315,7 @@ describe("event deduplication", () => {
 
     await emitEvent(eventHandlers, "issue.updated", event);
 
-    const requestBody = JSON.parse(mockDiscordFetch.mock.calls[0][1].body);
+    const requestBody = findDiscordPostBody(mockDiscordFetch);
     const embed = requestBody.embeds[0];
     const completedByField = embed.fields.find((f: { name: string }) => f.name === "Completed by");
     const summaryField = embed.fields.find((f: { name: string }) => f.name === "Summary");
@@ -339,7 +349,7 @@ describe("event deduplication", () => {
 
     await emitEvent(eventHandlers, "issue.updated", event);
 
-    const requestBody = JSON.parse(mockDiscordFetch.mock.calls[0][1].body);
+    const requestBody = findDiscordPostBody(mockDiscordFetch);
     const embed = requestBody.embeds[0];
     const completedByField = embed.fields.find((f: { name: string }) => f.name === "Completed by");
     expect(completedByField.value).toBe("Board user");
