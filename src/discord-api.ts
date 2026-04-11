@@ -61,18 +61,23 @@ async function discordFetch(
   return ctx.http.fetch(url, init);
 }
 
+function normalizeDiscordPathId(id: string | number): string {
+  return String(id);
+}
+
 export async function postEmbed(
   ctx: PluginContext,
   token: string,
-  channelId: string,
+  channelId: string | number,
   message: DiscordMessage,
 ): Promise<boolean> {
+  const safeChannelId = normalizeDiscordPathId(channelId);
   try {
     await withRetry(async () => {
       const response = await discordFetch(
         ctx,
         token,
-        `/channels/${channelId}/messages`,
+        `/channels/${safeChannelId}/messages`,
         {
           method: "POST",
           body: {
@@ -91,7 +96,7 @@ export async function postEmbed(
         ctx.logger.warn("Discord API error", {
           status: response.status,
           body: text,
-          channelId,
+          channelId: safeChannelId,
         });
         throw err;
       }
@@ -111,16 +116,17 @@ export async function postEmbed(
 export async function postEmbedWithId(
   ctx: PluginContext,
   token: string,
-  channelId: string,
+  channelId: string | number,
   message: DiscordMessage,
 ): Promise<string | null> {
+  const safeChannelId = normalizeDiscordPathId(channelId);
   try {
     let messageId: string | null = null;
     await withRetry(async () => {
       const response = await discordFetch(
         ctx,
         token,
-        `/channels/${channelId}/messages`,
+        `/channels/${safeChannelId}/messages`,
         {
           method: "POST",
           body: {
@@ -139,7 +145,7 @@ export async function postEmbedWithId(
         ctx.logger.warn("Discord API error", {
           status: response.status,
           body: text,
-          channelId,
+          channelId: safeChannelId,
         });
         throw err;
       }
@@ -163,18 +169,19 @@ export async function registerSlashCommands(
   ctx: PluginContext,
   token: string,
   applicationId: string,
-  guildId: string,
+  guildId: string | number,
   commands: Array<{
     name: string;
     description: string;
     options?: unknown[];
   }>,
 ): Promise<boolean> {
+  const safeGuildId = normalizeDiscordPathId(guildId);
   try {
     const response = await discordFetch(
       ctx,
       token,
-      `/applications/${applicationId}/guilds/${guildId}/commands`,
+      `/applications/${applicationId}/guilds/${safeGuildId}/commands`,
       { method: "PUT", body: commands },
     );
     if (!response.ok) {
@@ -197,14 +204,15 @@ export async function registerSlashCommands(
 export async function getChannelMessages(
   ctx: PluginContext,
   token: string,
-  channelId: string,
+  channelId: string | number,
   limit: number = 100,
 ): Promise<DiscordChannelMessage[]> {
+  const safeChannelId = normalizeDiscordPathId(channelId);
   try {
     const response = await discordFetch(
       ctx,
       token,
-      `/channels/${channelId}/messages?limit=${limit}`,
+      `/channels/${safeChannelId}/messages?limit=${limit}`,
     );
     if (!response.ok) return [];
     return (await response.json()) as DiscordChannelMessage[];
@@ -216,7 +224,7 @@ export async function getChannelMessages(
 export async function getChannelMessagesAll(
   ctx: PluginContext,
   token: string,
-  channelId: string,
+  channelId: string | number,
   opts: {
     maxMessages?: number;
     maxAgeDays?: number;
@@ -224,6 +232,7 @@ export async function getChannelMessagesAll(
     onProgress?: (fetched: number) => void;
   } = {},
 ): Promise<DiscordChannelMessage[]> {
+  const safeChannelId = normalizeDiscordPathId(channelId);
   const maxMessages = opts.maxMessages ?? 5000;
   const maxAgeDays = opts.maxAgeDays ?? 90;
   const pageDelayMs = opts.pageDelayMs ?? 500;
@@ -234,8 +243,8 @@ export async function getChannelMessagesAll(
 
   while (allMessages.length < maxMessages) {
     const query = before
-      ? `/channels/${channelId}/messages?limit=100&before=${before}`
-      : `/channels/${channelId}/messages?limit=100`;
+      ? `/channels/${safeChannelId}/messages?limit=100&before=${before}`
+      : `/channels/${safeChannelId}/messages?limit=100`;
 
     try {
       const response = await discordFetch(ctx, token, query);
@@ -270,13 +279,14 @@ export async function getChannelMessagesAll(
 export async function getGuildRoles(
   ctx: PluginContext,
   token: string,
-  guildId: string,
+  guildId: string | number,
 ): Promise<DiscordGuildRole[]> {
+  const safeGuildId = normalizeDiscordPathId(guildId);
   try {
     const response = await discordFetch(
       ctx,
       token,
-      `/guilds/${guildId}/roles`,
+      `/guilds/${safeGuildId}/roles`,
     );
     if (!response.ok) return [];
     return (await response.json()) as DiscordGuildRole[];
