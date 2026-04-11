@@ -12,15 +12,16 @@
     "typecheck": "tsc --noEmit",
     "dev": "tsc --watch",
     "test": "vitest run",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "prepare": "npm run build"
   },
   "peerDependencies": {
     "@paperclipai/plugin-sdk": "*",
     "@paperclipai/shared": "*"
   },
   "devDependencies": {
-    "@paperclipai/plugin-sdk": "^2026.318.0",
-    "@paperclipai/shared": "^2026.318.0",
+    "@paperclipai/plugin-sdk": "^2026.403.0",
+    "@paperclipai/shared": "^2026.403.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   },
