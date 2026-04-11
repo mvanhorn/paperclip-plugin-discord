@@ -266,7 +266,7 @@ describe("topic routing", () => {
   it("enriches issue.created before topic routing so issue project names can map to a topic channel", async () => {
     const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext(
       { topicRouting: true, notifyOnIssueCreated: true },
-      { "channel-project-map": { "my-project": "1492469315486748802" } },
+      { "channel-project-map": { "my-project": "1234567890123456789" } },
     );
     ctx.issues.get = vi.fn().mockResolvedValue({
       id: "entity-1",
@@ -289,7 +289,7 @@ describe("topic routing", () => {
       (call: any[]) => typeof call[0] === "string" && call[0].includes("/channels/"),
     );
     expect(postCall).toBeDefined();
-    expect(postCall![0]).toContain("1492469315486748802");
+    expect(postCall![0]).toContain("1234567890123456789");
   });
 
   it("rejects non-string set-channel inputs so truncated numeric snowflakes cannot be stored", async () => {
@@ -301,7 +301,7 @@ describe("topic routing", () => {
 
     const numericResult = await setChannel!({
       companyId: "company-1",
-      channelId: 1492469315486748802,
+      channelId: 1234567890123456789,
     });
     expect(numericResult).toEqual({
       ok: false,
@@ -311,12 +311,12 @@ describe("topic routing", () => {
 
     const validResult = await setChannel!({
       companyId: "company-1",
-      channelId: "1492469315486748802",
+      channelId: "1234567890123456789",
     });
     expect(validResult).toEqual({ ok: true });
     expect(ctx.state.set).toHaveBeenCalledWith(
       expect.objectContaining({ scopeKind: "company", scopeId: "company-1", stateKey: "discord-channel" }),
-      "1492469315486748802",
+      "1234567890123456789",
     );
   });
 });
