@@ -171,6 +171,14 @@ async function enrichIssueNotificationPayload(
       if (payload.assigneeAgentId == null) payload.assigneeAgentId = issue.assigneeAgentId;
       if (payload.assigneeUserId == null) payload.assigneeUserId = issue.assigneeUserId;
       if (payload.agentName == null) payload.agentName = issue.executionAgentNameKey;
+      // executionAgentNameKey is not always populated — fall back to looking up the
+      // assignee agent's display name so "Completed by" shows "Scribe" not "Agent".
+      if (payload.agentName == null && (payload.assigneeAgentId || issue.assigneeAgentId)) {
+        const agentId = payload.assigneeAgentId ?? issue.assigneeAgentId;
+        const agents = await ctx.agents.list({ companyId });
+        const match = (agents as Array<{ id: string; name: string }>).find((a) => a.id === agentId);
+        if (match?.name) payload.agentName = match.name;
+      }
       if (payload.completedAt == null && issue.completedAt) payload.completedAt = String(issue.completedAt);
       if (payload.updatedAt == null && issue.updatedAt) payload.updatedAt = String(issue.updatedAt);
       if (payload.projectName == null && issue.project?.name) payload.projectName = issue.project.name;
