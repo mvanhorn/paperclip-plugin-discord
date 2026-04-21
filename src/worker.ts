@@ -518,7 +518,8 @@ const plugin = definePlugin({
       formatter: (e: PluginEvent, baseUrl?: string) => ReturnType<typeof formatIssueCreated>,
       overrideChannelId?: string,
       channelMap?: Record<string, string>,
-    ) => {
+      onPosted?: (channelId: string, messageId: string) => Promise<void>,
+    ): Promise<void> => {
       if (isDuplicate(event.eventId)) {
         ctx.logger.debug(`Skipping duplicate event ${event.eventType} (${event.eventId})`);
         return;
@@ -551,6 +552,10 @@ const plugin = definePlugin({
           entityType: "plugin",
           entityId: event.entityId,
         });
+
+        if (onPosted) {
+          await onPosted(channelId, messageId);
+        }
       }
     };
 
@@ -588,14 +593,67 @@ const plugin = definePlugin({
     }
 
     if (config.notifyOnApprovalCreated) {
-      ctx.events.on("approval.created", (event: PluginEvent) =>
-        notify(
+      ctx.events.on("approval.created", async (event: PluginEvent) => {
+        await notify(
           event,
           formatApprovalCreated,
           approvalsChannelId ?? undefined,
           config.approvalsChannels,
-        ),
-      );
+          async (channelId, messageId) => {
+            // Store reverse mapping so decision events can update the original message
+            await ctx.state.set(
+              { scopeKind: "instance", stateKey: `approval_${event.entityId}` },
+              { channelId, messageId },
+            );
+          },
+        );
+      });
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ctx.events.on("approval.approved" as any, async (event: PluginEvent) => {
+        const record = await ctx.state.get({
+          scopeKind: "instance",
+          stateKey: `approval_${event.entityId}`,
+        }) as { channelId: string; messageId: string } | null;
+        if (!record) return;
+
+        const decidedBy = event.actorId ?? "";
+        const label = decidedBy ? `✅ Approved by ${decidedBy}` : "✅ Approved";
+        await adapter.editMessage(record.channelId, record.messageId, {
+          embeds: [
+            {
+              title: label,
+              color: COLORS.GREEN,
+              footer: { text: "Paperclip" },
+              timestamp: event.occurredAt,
+            },
+          ],
+          components: [],
+        });
+      });
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ctx.events.on("approval.rejected" as any, async (event: PluginEvent) => {
+        const record = await ctx.state.get({
+          scopeKind: "instance",
+          stateKey: `approval_${event.entityId}`,
+        }) as { channelId: string; messageId: string } | null;
+        if (!record) return;
+
+        const decidedBy = event.actorId ?? "";
+        const label = decidedBy ? `❌ Rejected by ${decidedBy}` : "❌ Rejected";
+        await adapter.editMessage(record.channelId, record.messageId, {
+          embeds: [
+            {
+              title: label,
+              color: COLORS.RED,
+              footer: { text: "Paperclip" },
+              timestamp: event.occurredAt,
+            },
+          ],
+          components: [],
+        });
+      });
     }
 
     if (config.notifyOnAgentError) {
