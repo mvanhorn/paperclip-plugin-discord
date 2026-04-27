@@ -15,9 +15,9 @@ export async function resolveCompanyId(ctx: PluginContext): Promise<string> {
   // Check if a guild-level default was set via /clip connect — always re-read
   // so that switching companies works without a plugin restart.
   try {
-    const connected = await ctx.state.get({ scopeKind: "instance", stateKey: "company_default" });
+    const connected = (await ctx.state.get({ scopeKind: "instance", stateKey: "company_default" })) as { companyId?: string } | null | undefined;
     if (connected?.companyId) {
-      return connected.companyId as string;
+      return connected.companyId;
     }
   } catch {
     // state API unavailable at this call site — fall through to list-based resolution
