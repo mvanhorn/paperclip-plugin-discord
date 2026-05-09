@@ -172,7 +172,12 @@ curl -X POST http://127.0.0.1:3100/api/plugins/install \
 2. Add a bot to the application and copy the bot token
 3. Enable the MESSAGE CONTENT privileged intent (for intelligence scanning)
 4. Invite the bot to your server with `applications.commands` and `bot` scopes
-5. In Paperclip, go to **Settings -> Secrets -> Create new secret**, paste your bot token as the secret value, and copy the resulting UUID
+5. In Paperclip, create a **company secret** holding your bot token, by either:
+
+   - **UI:** Open any agent's **Configuration → Environment variables**, enter a name (e.g. `discord-bot-token`) and the bot token as the value, then click **Create / Seal**. The secret is created at the **company level** (not bound to that agent — despite the agent-context UI) and the returned UUID can be used from any plugin in the company.
+   - **REST API:** `POST /api/companies/{companyId}/secrets` with body `{"name": "discord-bot-token", "value": "<your-bot-token>", "provider": "local_encrypted"}`. The response contains the secret's UUID.
+
+   Copy the resulting secret UUID — you'll paste it into `discordBotTokenRef` in the next step.
 6. Configure the plugin with the secret UUID in `discordBotTokenRef`, your guild ID, and channel ID
 
 ## Configuration
@@ -250,13 +255,12 @@ Brings the Discord plugin to full parity with the Telegram plugin across 14 feat
 
 ### v0.2.1
 
-The `discordBotTokenRef` field now requires a Paperclip secret reference (a UUID), not the raw token value. If you previously entered your raw bot token in the field, follow these steps to migrate:
+The `discordBotTokenRef` field now requires a Paperclip secret reference (a UUID), not the raw token value. If you previously entered a raw bot token in the field, follow these steps to migrate:
 
-1. Go to **Settings -> Secrets -> Create new secret**
-2. Paste your Discord bot token as the secret value and save
-3. Copy the resulting UUID
-4. Open **Plugin Settings for Discord Bot** and paste the UUID into "Discord Bot Token"
-5. Save and restart the plugin
+1. Create a company secret holding your bot token using one of the paths in the [Setup](#setup) section above (UI or REST API).
+2. Copy the returned secret UUID.
+3. Open **Plugin Settings for Discord Bot** and paste the UUID into "Discord Bot Token".
+4. Save and restart the plugin.
 
 The plugin will fail to activate if a raw token (non-UUID) is entered in the field.
 
