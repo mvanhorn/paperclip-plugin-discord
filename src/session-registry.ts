@@ -27,6 +27,17 @@ export interface AgentSessionEntry {
   spawnedAt: string;
   status: "running" | "completed" | "failed" | "cancelled";
   lastActivityAt: string;
+  /**
+   * Backing PaperClip issue created by `sessions.sendMessage` to deliver the
+   * prompt to the agent runtime. Populated when the upstream SDK fix
+   * (paperclipai/paperclip#6629) is deployed; absent on older PaperClip
+   * versions or for ACP-transport sessions.
+   *
+   * When present, `/acp close|cancel` propagates the user's intent into the
+   * underlying issue status. When absent, close/cancel degrade to local-only
+   * cleanup with a logger warning.
+   */
+  issueId?: string;
 }
 
 interface ThreadSessions {
@@ -163,6 +174,56 @@ async function saveThreadSessions(
   );
 }
 
+// Inverse index: sessionId → { threadId, companyId }. /acp close|cancel only
+// gets a sessionId, but sessions live under `sessions_<threadId>` so the
+// thread must be looked up by index. The index is written when the session
+// is created and cleared when it's closed.
+interface SessionThreadRecord {
+  threadId: string;
+  companyId: string;
+}
+
+function sessionThreadKey(sessionId: string): string {
+  return `session_thread_${sessionId}`;
+}
+
+async function saveSessionThreadIndex(
+  ctx: PluginContext,
+  sessionId: string,
+  threadId: string,
+  companyId: string,
+): Promise<void> {
+  await ctx.state.set(
+    { scopeKind: "company", scopeId: companyId, stateKey: sessionThreadKey(sessionId) },
+    { threadId, companyId } as SessionThreadRecord,
+  );
+}
+
+async function lookupSessionThread(
+  ctx: PluginContext,
+  sessionId: string,
+  companyId?: string,
+): Promise<SessionThreadRecord | null> {
+  const key = sessionThreadKey(sessionId);
+  if (companyId) {
+    const raw = await ctx.state.get({ scopeKind: "company", scopeId: companyId, stateKey: key });
+    if (raw) return raw as SessionThreadRecord;
+  }
+  const fallback = await ctx.state.get({ scopeKind: "company", scopeId: "default", stateKey: key });
+  return (fallback as SessionThreadRecord) ?? null;
+}
+
+async function clearSessionThreadIndex(
+  ctx: PluginContext,
+  sessionId: string,
+  companyId: string,
+): Promise<void> {
+  await ctx.state.set(
+    { scopeKind: "company", scopeId: companyId, stateKey: sessionThreadKey(sessionId) },
+    null,
+  );
+}
+
 async function getHandoff(ctx: PluginContext, handoffId: string, companyId?: string): Promise<HandoffRecord | null> {
   const key = `handoff_${handoffId}`;
   if (companyId) {
@@ -273,6 +334,8 @@ export async function spawnAgentInThread(
   let sessionId: string | undefined;
   let transport: TransportKind = "native";
 
+  let nativeIssueId: string | undefined;
+
   try {
     const session = await ctx.agents.sessions.create(agentId, companyId, {
       taskKey: `discord-thread-${threadId}`,
@@ -280,8 +343,13 @@ export async function spawnAgentInThread(
     });
     sessionId = session.sessionId;
 
-    // Send the initial prompt
-    await ctx.agents.sessions.sendMessage(sessionId!, companyId, {
+    // Send the initial prompt. After paperclipai/paperclip#6629 lands and a
+    // new SDK release exposes `issueId` on AgentSessionSendResult, the cast
+    // becomes a no-op and we get the backing-issue id we need to drive
+    // `/acp close|cancel`. Pre-fix PaperClip returns no issueId; we degrade
+    // gracefully (close/cancel won't update the issue but still clean up
+    // local state).
+    const sendResult = await ctx.agents.sessions.sendMessage(sessionId!, companyId, {
       prompt: taskPrompt,
       reason: "Initial task prompt from Discord",
       onEvent: (event: AgentSessionEvent) => {
@@ -292,6 +360,7 @@ export async function spawnAgentInThread(
         }
       },
     });
+    nativeIssueId = (sendResult as { issueId?: string } | undefined)?.issueId;
   } catch (nativeErr) {
     ctx.logger.warn("Native session create failed, trying ACP fallback", {
       agentName,
@@ -332,9 +401,11 @@ export async function spawnAgentInThread(
     spawnedAt: now,
     status: "running",
     lastActivityAt: now,
+    ...(nativeIssueId ? { issueId: nativeIssueId } : {}),
   };
   sessions.push(entry);
   await saveThreadSessions(ctx, threadId, sessions, companyId);
+  await saveSessionThreadIndex(ctx, sessionId, threadId, companyId);
   await ctx.metrics.write(METRIC_NAMES.agentSessionsCreated, 1);
 
   if (running.length > 0) {
@@ -358,6 +429,97 @@ export async function spawnAgentInThread(
 // ---------------------------------------------------------------------------
 // Close agent
 // ---------------------------------------------------------------------------
+
+/**
+ * Close or cancel a session by sessionId, propagating the user's intent to
+ * the backing PaperClip issue when the upstream SDK exposes it.
+ *
+ * Behavior:
+ * - "close": mark backing issue status = "done" (if known); set local entry status = "completed".
+ * - "cancel": post explanatory comment, mark backing issue status = "cancelled" (if known); set local entry status = "cancelled".
+ *
+ * Degrades gracefully on pre-upstream-fix PaperClip: when no backing issueId
+ * is recorded on the entry, the issue is left untouched (warning logged) and
+ * local cleanup proceeds as before.
+ */
+export async function closeSessionById(
+  ctx: PluginContext,
+  token: string,
+  sessionId: string,
+  companyId: string,
+  intent: "close" | "cancel",
+): Promise<{ ok: boolean; error?: string; issueUpdated: boolean }> {
+  const index = await lookupSessionThread(ctx, sessionId, companyId);
+  if (!index) {
+    return {
+      ok: false,
+      error: `Session \`${sessionId}\` not found in this plugin's registry.`,
+      issueUpdated: false,
+    };
+  }
+
+  const sessions = await getThreadSessions(ctx, index.threadId, index.companyId);
+  const entry = sessions.find((s) => s.sessionId === sessionId);
+  if (!entry) {
+    // Index pointed at a thread that no longer has the session — orphaned index.
+    await clearSessionThreadIndex(ctx, sessionId, index.companyId);
+    return {
+      ok: false,
+      error: `Session \`${sessionId}\` registered under thread but no entry found; index cleared.`,
+      issueUpdated: false,
+    };
+  }
+
+  let issueUpdated = false;
+  if (entry.issueId) {
+    try {
+      if (intent === "cancel") {
+        await ctx.issues.createComment(
+          entry.issueId,
+          `Session cancelled via \`/acp cancel\` from Discord (sessionId=${sessionId}).`,
+          entry.companyId,
+        );
+      }
+      const targetStatus = intent === "cancel" ? "cancelled" : "done";
+      await ctx.issues.update(entry.issueId, { status: targetStatus }, entry.companyId);
+      issueUpdated = true;
+    } catch (issueErr) {
+      ctx.logger.warn("Failed to update backing issue on session close/cancel", {
+        sessionId,
+        issueId: entry.issueId,
+        intent,
+        error: issueErr instanceof Error ? issueErr.message : String(issueErr),
+      });
+    }
+  } else {
+    ctx.logger.warn("No backing issueId on session entry; close/cancel will only update local state", {
+      sessionId,
+      intent,
+      transport: entry.transport,
+    });
+  }
+
+  // Close the underlying SDK session (best-effort; warn but don't fail close/cancel).
+  try {
+    if (entry.transport === "native") {
+      await ctx.agents.sessions.close(sessionId, entry.companyId);
+    } else {
+      ctx.events.emit("acp-close", entry.companyId, { sessionId });
+    }
+  } catch (closeErr) {
+    ctx.logger.warn("Failed to close underlying SDK session", {
+      sessionId,
+      error: closeErr instanceof Error ? closeErr.message : String(closeErr),
+    });
+  }
+
+  entry.status = intent === "cancel" ? "cancelled" : "completed";
+  entry.lastActivityAt = new Date().toISOString();
+  await saveThreadSessions(ctx, index.threadId, sessions, index.companyId);
+  await clearSessionThreadIndex(ctx, sessionId, index.companyId);
+
+  return { ok: true, issueUpdated };
+}
 
 export async function closeAgentInThread(
   ctx: PluginContext,
@@ -1144,7 +1306,14 @@ export async function handleAcpCommand(
       if (!sessionId) {
         return respondToInteraction({ type: 4, content: `Usage: \`/acp ${subcommand.name} session:<id>\``, ephemeral: true });
       }
-      return respondToInteraction({ type: 4, content: `${subcommand.name === "cancel" ? "Cancelling" : "Closing"} session \`${sessionId}\`...` });
+      const intent = subcommand.name === "cancel" ? "cancel" : "close";
+      const result = await closeSessionById(ctx, token, sessionId, companyId, intent);
+      if (!result.ok) {
+        return respondToInteraction({ type: 4, content: result.error ?? `Failed to ${intent} session.`, ephemeral: true });
+      }
+      const verb = intent === "cancel" ? "Cancelled" : "Closed";
+      const suffix = result.issueUpdated ? "" : " (backing issue not updated — see logs)";
+      return respondToInteraction({ type: 4, content: `${verb} session \`${sessionId}\`${suffix}.` });
     }
 
     default:
