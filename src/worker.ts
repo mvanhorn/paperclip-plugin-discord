@@ -449,6 +449,24 @@ const plugin = definePlugin({
       config.enableProactiveSuggestions === true ||
       config.enableIntelligence === true;
 
+    // --- Phase 1 war-room voice: enabled only if all env vars set ---
+    // Voice startup is gated on env vars (not plugin config) for Phase 1 — the
+    // operator wires DEEPGRAM_API_KEY, WAR_ROOM_GUILD_ID, WAR_ROOM_VOICE_CHANNEL_ID,
+    // and MICHAEL_VOICE_WEBHOOK_URL on the container; if any are absent, voice
+    // initializes nothing (text routing keeps working).
+    const voiceEnv = {
+      guildId: process.env.WAR_ROOM_GUILD_ID,
+      voiceChannelId: process.env.WAR_ROOM_VOICE_CHANNEL_ID,
+      webhookUrl: process.env.MICHAEL_VOICE_WEBHOOK_URL,
+      deepgramApiKey: process.env.DEEPGRAM_API_KEY,
+    };
+    const voiceEnabled = !!(
+      voiceEnv.guildId &&
+      voiceEnv.voiceChannelId &&
+      voiceEnv.webhookUrl &&
+      voiceEnv.deepgramApiKey
+    );
+
     // --- Gateway connection for real-time interaction handling ---
     const gateway = await connectGateway(
       ctx,
@@ -460,10 +478,51 @@ const plugin = definePlugin({
       {
         listenForMessages: gatewayNeedsMessages,
         includeMessageContent: gatewayNeedsMessages,
+        enableVoice: voiceEnabled,
       },
     );
 
+    // --- Phase 1 voice client startup ---
+    // Failures here are isolated — voice errors must not crash the plugin or
+    // affect text routing. See docs/superpowers/specs/2026-05-28-war-room-voice-design.md
+    // §6 "Voice failure never blocks text."
+    let voiceClientStop: (() => void) | null = null;
+    if (voiceEnabled && gateway.voice) {
+      try {
+        const { WarRoomVoiceClient, createPluginDiscordAdapter } = await import(
+          "./voice/index.js"
+        );
+        const adapterCreator = createPluginDiscordAdapter(gateway.voice);
+        const voiceClient = new WarRoomVoiceClient(ctx, {
+          guildId: voiceEnv.guildId!,
+          voiceChannelId: voiceEnv.voiceChannelId!,
+          textChannelWebhookUrl: voiceEnv.webhookUrl!,
+          deepgramApiKey: voiceEnv.deepgramApiKey!,
+          voiceAdapterCreator: adapterCreator,
+        });
+        await voiceClient.start();
+        voiceClientStop = () => voiceClient.stop();
+      } catch (error) {
+        ctx.logger.error("voice: startup failed (continuing without voice)", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    } else if (!voiceEnabled) {
+      ctx.logger.info(
+        "voice: disabled — missing one of WAR_ROOM_GUILD_ID, WAR_ROOM_VOICE_CHANNEL_ID, MICHAEL_VOICE_WEBHOOK_URL, DEEPGRAM_API_KEY",
+      );
+    }
+
     ctx.events.on("plugin.stopping", async () => {
+      if (voiceClientStop) {
+        try {
+          voiceClientStop();
+        } catch (error) {
+          ctx.logger.warn("voice: stop failed during plugin shutdown", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
       gateway.close();
     });
 
