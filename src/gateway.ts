@@ -7,6 +7,7 @@ const MAX_CONSECUTIVE_FAILURES = 5;
 const MAX_BACKOFF_MS = 60_000;
 const DEFAULT_RECONNECT_MS = 5000;
 const GUILD_INTENT = 1;
+const GUILD_VOICE_STATES_INTENT = 128;
 const GUILD_MESSAGES_INTENT = 512;
 const MESSAGE_CONTENT_INTENT = 32768;
 
@@ -44,12 +45,61 @@ export interface MessageCreateEvent {
   };
 }
 
+/** VOICE_STATE_UPDATE dispatch event payload (Discord Gateway op 0, t = VOICE_STATE_UPDATE). */
+export interface VoiceStateUpdateEvent {
+  guild_id?: string;
+  channel_id: string | null;
+  user_id: string;
+  session_id: string;
+  // Other fields exist (member, mute, deaf, ...) but @discordjs/voice only needs the above.
+  [key: string]: unknown;
+}
+
+/** VOICE_SERVER_UPDATE dispatch event payload (Discord Gateway op 0, t = VOICE_SERVER_UPDATE). */
+export interface VoiceServerUpdateEvent {
+  token: string;
+  guild_id: string;
+  endpoint: string | null;
+  [key: string]: unknown;
+}
+
+/** Arbitrary gateway payload (used by voice.sendPayload to emit op 4 voice state updates). */
+export interface GatewaySendPayload {
+  op: number;
+  d: unknown;
+}
+
 type InteractionHandler = (interaction: InteractionCreateEvent) => Promise<unknown>;
 type MessageHandler = (message: MessageCreateEvent) => Promise<void>;
+type VoiceStateUpdateHandler = (event: VoiceStateUpdateEvent) => void;
+type VoiceServerUpdateHandler = (event: VoiceServerUpdateEvent) => void;
 
 export interface GatewayOptions {
   listenForMessages?: boolean;
   includeMessageContent?: boolean;
+  /** Enable GUILD_VOICE_STATES intent + VOICE_STATE_UPDATE/VOICE_SERVER_UPDATE dispatch. */
+  enableVoice?: boolean;
+}
+
+/**
+ * Voice-related primitives surfaced on the gateway handle when `enableVoice` is true.
+ * Designed to plug straight into a custom @discordjs/voice DiscordGatewayAdapterCreator.
+ * See docs/superpowers/research/2026-05-28-plugin-sdk-voice-feasibility.md in the
+ * MRTek repo for the architecture rationale.
+ */
+export interface GatewayVoiceHandle {
+  /** Send a raw gateway payload (typically op 4 voice-state-update). Returns true if sent. */
+  sendPayload(payload: GatewaySendPayload): boolean;
+  /** Subscribe to VOICE_STATE_UPDATE dispatch events. */
+  onVoiceStateUpdate(handler: VoiceStateUpdateHandler): void;
+  /** Subscribe to VOICE_SERVER_UPDATE dispatch events. */
+  onVoiceServerUpdate(handler: VoiceServerUpdateHandler): void;
+}
+
+export interface GatewayHandle {
+  close: () => void;
+  /** Present when `options.enableVoice` was true at connect time. */
+  voice?: GatewayVoiceHandle;
 }
 
 export async function respondViaCallback(
@@ -90,7 +140,7 @@ export async function connectGateway(
   onInteraction: InteractionHandler,
   onMessage?: MessageHandler,
   options: GatewayOptions = {},
-): Promise<{ close: () => void }> {
+): Promise<GatewayHandle> {
   if (typeof WebSocket === "undefined") {
     ctx.logger.warn(
       "WebSocket is not available in this environment (requires Node.js >= 21). " +
@@ -116,10 +166,18 @@ export async function connectGateway(
   let lastHeartbeatIntervalMs = 41250;
   const listenForMessages = options.listenForMessages ?? Boolean(onMessage);
   const includeMessageContent = options.includeMessageContent ?? listenForMessages;
+  const enableVoice = options.enableVoice ?? false;
   const intents =
     GUILD_INTENT |
+    (enableVoice ? GUILD_VOICE_STATES_INTENT : 0) |
     (listenForMessages ? GUILD_MESSAGES_INTENT : 0) |
     (includeMessageContent ? MESSAGE_CONTENT_INTENT : 0);
+
+  // Voice dispatch subscriber lists — populated by external consumers (the voice
+  // module) via the `voice` handle returned below. Filled in once the gateway
+  // is connected and VOICE_STATE_UPDATE / VOICE_SERVER_UPDATE events arrive.
+  const voiceStateUpdateHandlers: VoiceStateUpdateHandler[] = [];
+  const voiceServerUpdateHandlers: VoiceServerUpdateHandler[] = [];
 
   function getReconnectDelay(): number {
     if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
@@ -209,6 +267,32 @@ export async function connectGateway(
               ctx.logger.error("Gateway message handler error", {
                 error: error instanceof Error ? error.message : String(error),
               });
+            }
+          }
+
+          if (payload.t === "VOICE_STATE_UPDATE" && enableVoice) {
+            const event = payload.d as VoiceStateUpdateEvent;
+            for (const handler of voiceStateUpdateHandlers) {
+              try {
+                handler(event);
+              } catch (error) {
+                ctx.logger.error("Voice state update handler error", {
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              }
+            }
+          }
+
+          if (payload.t === "VOICE_SERVER_UPDATE" && enableVoice) {
+            const event = payload.d as VoiceServerUpdateEvent;
+            for (const handler of voiceServerUpdateHandlers) {
+              try {
+                handler(event);
+              } catch (error) {
+                ctx.logger.error("Voice server update handler error", {
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              }
             }
           }
           break;
@@ -313,7 +397,7 @@ export async function connectGateway(
 
   connect(gatewayUrl, false);
 
-  return {
+  const handle: GatewayHandle = {
     close: () => {
       closed = true;
       cleanup();
@@ -322,6 +406,26 @@ export async function connectGateway(
       }
     },
   };
+
+  if (enableVoice) {
+    handle.voice = {
+      sendPayload(payload: GatewaySendPayload): boolean {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(payload));
+          return true;
+        }
+        return false;
+      },
+      onVoiceStateUpdate(handler: VoiceStateUpdateHandler): void {
+        voiceStateUpdateHandlers.push(handler);
+      },
+      onVoiceServerUpdate(handler: VoiceServerUpdateHandler): void {
+        voiceServerUpdateHandlers.push(handler);
+      },
+    };
+  }
+
+  return handle;
 }
 
 async function getGatewayUrl(ctx: PluginContext, token: string): Promise<string | null> {
