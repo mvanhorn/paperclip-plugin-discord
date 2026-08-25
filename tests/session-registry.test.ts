@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   parseAgentMention,
+  spawnAgentInThread,
+  closeSessionById,
+  handleAcpCommand,
   type AgentSessionEntry,
   type TransportKind,
 } from "../src/session-registry.js";
@@ -375,5 +378,229 @@ describe("output sequencing", () => {
     const agentDisplayName = "CodeBot";
     const prefix = multiAgent ? `**[${agentDisplayName}]** ` : "";
     expect(prefix).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /acp close|cancel → backing issue propagation
+// (Depends on paperclipai/paperclip#6629 — sessions.sendMessage returning issueId)
+// ---------------------------------------------------------------------------
+
+function makeAcpCtx(opts: {
+  sendMessageResult?: { runId: string; issueId?: string };
+  sessionCreateId?: string;
+  issuesUpdate?: ReturnType<typeof vi.fn>;
+  issuesCreateComment?: ReturnType<typeof vi.fn>;
+  sessionClose?: ReturnType<typeof vi.fn>;
+} = {}) {
+  const store = new Map<string, unknown>();
+  const issuesUpdate = opts.issuesUpdate ?? vi.fn().mockResolvedValue({ id: "issue-1", status: "done" });
+  const issuesCreateComment =
+    opts.issuesCreateComment ?? vi.fn().mockResolvedValue({ id: "cmt-1" });
+  const sessionClose = opts.sessionClose ?? vi.fn().mockResolvedValue(undefined);
+  return {
+    store,
+    ctx: {
+      metrics: { write: vi.fn().mockResolvedValue(undefined) },
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      agents: {
+        list: vi.fn().mockResolvedValue([{ id: "agent-1", name: "CodeBot", displayName: "CodeBot" }]),
+        sessions: {
+          create: vi
+            .fn()
+            .mockResolvedValue({ sessionId: opts.sessionCreateId ?? "sess-new" }),
+          sendMessage: vi
+            .fn()
+            .mockResolvedValue(opts.sendMessageResult ?? { runId: "run-1", issueId: "issue-1" }),
+          close: sessionClose,
+        },
+      },
+      issues: {
+        update: issuesUpdate,
+        createComment: issuesCreateComment,
+      },
+      state: {
+        get: vi.fn().mockImplementation(({ stateKey }: { stateKey: string }) => {
+          return Promise.resolve(store.get(stateKey) ?? null);
+        }),
+        set: vi
+          .fn()
+          .mockImplementation(({ stateKey }: { stateKey: string }, value: unknown) => {
+            if (value === null) store.delete(stateKey);
+            else store.set(stateKey, value);
+            return Promise.resolve(undefined);
+          }),
+      },
+      http: {
+        fetch: vi.fn().mockResolvedValue({
+          ok: true,
+          json: () => Promise.resolve({ id: "thread-1" }),
+          text: () => Promise.resolve(""),
+        }),
+      },
+      events: { emit: vi.fn(), on: vi.fn() },
+    } as any,
+    issuesUpdate,
+    issuesCreateComment,
+    sessionClose,
+  };
+}
+
+describe("spawnAgentInThread → captures issueId from sendMessage", () => {
+  it("stores issueId on the AgentSessionEntry when sendMessage returns it", async () => {
+    const { ctx, store } = makeAcpCtx({
+      sessionCreateId: "sess-A",
+      sendMessageResult: { runId: "run-1", issueId: "issue-A" },
+    });
+    const result = await spawnAgentInThread(ctx, "tok", "thr-1", "CodeBot", "co-1", "do the thing");
+    expect(result.ok).toBe(true);
+    const persisted = store.get("sessions_thr-1") as { sessions: AgentSessionEntry[] };
+    expect(persisted.sessions[0]!.issueId).toBe("issue-A");
+  });
+
+  it("writes a sessionId → thread index for later /acp close lookup", async () => {
+    const { ctx, store } = makeAcpCtx({
+      sessionCreateId: "sess-B",
+      sendMessageResult: { runId: "run-1", issueId: "issue-B" },
+    });
+    await spawnAgentInThread(ctx, "tok", "thr-2", "CodeBot", "co-1", "task");
+    expect(store.get("session_thread_sess-B")).toEqual({ threadId: "thr-2", companyId: "co-1" });
+  });
+
+  it("omits issueId when sendMessage returns no issueId (pre-upstream-fix PaperClip)", async () => {
+    const { ctx, store } = makeAcpCtx({
+      sessionCreateId: "sess-C",
+      sendMessageResult: { runId: "run-1" },
+    });
+    await spawnAgentInThread(ctx, "tok", "thr-3", "CodeBot", "co-1", "task");
+    const persisted = store.get("sessions_thr-3") as { sessions: AgentSessionEntry[] };
+    expect(persisted.sessions[0]!.issueId).toBeUndefined();
+  });
+});
+
+describe("closeSessionById", () => {
+  it('close: updates backing issue to status="done" and clears the index', async () => {
+    const { ctx, store, issuesUpdate, sessionClose } = makeAcpCtx({
+      sessionCreateId: "sess-1",
+      sendMessageResult: { runId: "run-1", issueId: "issue-1" },
+    });
+    await spawnAgentInThread(ctx, "tok", "thr-1", "CodeBot", "co-1", "task");
+    const result = await closeSessionById(ctx, "tok", "sess-1", "co-1", "close");
+    expect(result.ok).toBe(true);
+    expect(result.issueUpdated).toBe(true);
+    expect(issuesUpdate).toHaveBeenCalledWith("issue-1", { status: "done" }, "co-1");
+    expect(sessionClose).toHaveBeenCalledWith("sess-1", "co-1");
+    expect(store.get("session_thread_sess-1")).toBeUndefined();
+    const persisted = store.get("sessions_thr-1") as { sessions: AgentSessionEntry[] };
+    expect(persisted.sessions[0]!.status).toBe("completed");
+  });
+
+  it('cancel: posts an explanatory comment and updates issue to status="cancelled"', async () => {
+    const { ctx, issuesCreateComment, issuesUpdate } = makeAcpCtx({
+      sessionCreateId: "sess-2",
+      sendMessageResult: { runId: "run-1", issueId: "issue-2" },
+    });
+    await spawnAgentInThread(ctx, "tok", "thr-1", "CodeBot", "co-1", "task");
+    const result = await closeSessionById(ctx, "tok", "sess-2", "co-1", "cancel");
+    expect(result.ok).toBe(true);
+    expect(result.issueUpdated).toBe(true);
+    expect(issuesCreateComment).toHaveBeenCalledWith(
+      "issue-2",
+      expect.stringContaining("/acp cancel"),
+      "co-1",
+    );
+    expect(issuesUpdate).toHaveBeenCalledWith("issue-2", { status: "cancelled" }, "co-1");
+  });
+
+  it("graceful degradation: missing issueId still cleans local state, leaves issue untouched", async () => {
+    const { ctx, store, issuesUpdate, issuesCreateComment } = makeAcpCtx({
+      sessionCreateId: "sess-3",
+      sendMessageResult: { runId: "run-1" }, // no issueId
+    });
+    await spawnAgentInThread(ctx, "tok", "thr-1", "CodeBot", "co-1", "task");
+    const result = await closeSessionById(ctx, "tok", "sess-3", "co-1", "close");
+    expect(result.ok).toBe(true);
+    expect(result.issueUpdated).toBe(false);
+    expect(issuesUpdate).not.toHaveBeenCalled();
+    expect(issuesCreateComment).not.toHaveBeenCalled();
+    const persisted = store.get("sessions_thr-1") as { sessions: AgentSessionEntry[] };
+    expect(persisted.sessions[0]!.status).toBe("completed");
+  });
+
+  it("returns an error when the session is not in the registry", async () => {
+    const { ctx } = makeAcpCtx();
+    const result = await closeSessionById(ctx, "tok", "sess-unknown", "co-1", "close");
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("not found");
+  });
+
+  it("survives backing-issue update failure: cleans local state, logs a warning", async () => {
+    const { ctx, store } = makeAcpCtx({
+      sessionCreateId: "sess-4",
+      sendMessageResult: { runId: "run-1", issueId: "issue-4" },
+      issuesUpdate: vi.fn().mockRejectedValue(new Error("403 forbidden")),
+    });
+    await spawnAgentInThread(ctx, "tok", "thr-1", "CodeBot", "co-1", "task");
+    const result = await closeSessionById(ctx, "tok", "sess-4", "co-1", "close");
+    expect(result.ok).toBe(true);
+    expect(result.issueUpdated).toBe(false);
+    const persisted = store.get("sessions_thr-1") as { sessions: AgentSessionEntry[] };
+    expect(persisted.sessions[0]!.status).toBe("completed");
+  });
+});
+
+describe("handleAcpCommand close/cancel", () => {
+  it("close: invokes closeSessionById for the given sessionId and responds with confirmation", async () => {
+    const { ctx, issuesUpdate } = makeAcpCtx({
+      sessionCreateId: "sess-X",
+      sendMessageResult: { runId: "run-1", issueId: "issue-X" },
+    });
+    await spawnAgentInThread(ctx, "tok", "thr-1", "CodeBot", "co-1", "task");
+    const data = {
+      options: [
+        {
+          name: "close",
+          options: [{ name: "session", value: "sess-X" }],
+        },
+      ],
+    };
+    const reply: any = await handleAcpCommand(ctx, "tok", data, "co-1", "channel-1");
+    expect(issuesUpdate).toHaveBeenCalledWith("issue-X", { status: "done" }, "co-1");
+    expect(reply.data.content).toContain("Closed");
+    expect(reply.data.content).toContain("sess-X");
+  });
+
+  it("cancel: posts the cancellation comment and confirms in the response", async () => {
+    const { ctx, issuesCreateComment } = makeAcpCtx({
+      sessionCreateId: "sess-Y",
+      sendMessageResult: { runId: "run-1", issueId: "issue-Y" },
+    });
+    await spawnAgentInThread(ctx, "tok", "thr-1", "CodeBot", "co-1", "task");
+    const data = {
+      options: [
+        {
+          name: "cancel",
+          options: [{ name: "session", value: "sess-Y" }],
+        },
+      ],
+    };
+    const reply: any = await handleAcpCommand(ctx, "tok", data, "co-1", "channel-1");
+    expect(issuesCreateComment).toHaveBeenCalled();
+    expect(reply.data.content).toContain("Cancelled");
+  });
+
+  it("close with unknown sessionId: returns ephemeral error response", async () => {
+    const { ctx } = makeAcpCtx();
+    const data = {
+      options: [
+        {
+          name: "close",
+          options: [{ name: "session", value: "sess-missing" }],
+        },
+      ],
+    };
+    const reply: any = await handleAcpCommand(ctx, "tok", data, "co-1", "channel-1");
+    expect(reply.data.flags).toBe(64); // EPHEMERAL flag
+    expect(reply.data.content).toContain("not found");
   });
 });
