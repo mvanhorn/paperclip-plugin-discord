@@ -7,6 +7,99 @@ Bidirectional Discord integration for [Paperclip](https://github.com/paperclipai
 
 Built on the Paperclip plugin SDK and the domain event bridge ([PR #909](https://github.com/paperclipai/paperclip/pull/909)).
 
+## This fork
+
+This is Sage Advice's private fork, at `sageadvicellc/paperclip-plugin-discord`. It
+adds one Discord bot per agent, restricts every inbound path to one person, and
+adds local voice transcription. It removes the features that let agents wake
+other agents.
+
+**One bot per lead agent, and a lead's bot also speaks for its workers.**
+`agentBots` maps a lead agent's ID to its own bot token and channel. A
+notification about an issue posts through the assignee's bot: its own lead
+entry, or the lead entry that names it under `alsoForAgentIds`. With no match
+anywhere, it falls back to the plugin's own `discordBotTokenRef` bot.
+`alsoForAgentIds` is a plain list of worker agent IDs, set by hand — nothing
+here looks up a reporting line at run time. Hanna set the four leads on
+2026-09-26:
+
+```json
+{
+  "agentBots": [
+    {
+      "agentId": "665fc38d-3f2d-4a2e-9890-8ba8861e41be",
+      "botTokenRef": "<secret uuid>",
+      "channelId": "1553316428529274983"
+    },
+    {
+      "agentId": "00f3e5a2-7520-467e-9017-a27647e6261f",
+      "botTokenRef": "<secret uuid>",
+      "channelId": "1553316430898929725",
+      "alsoForAgentIds": [
+        "93a6bde1-ac1f-4b40-be3c-876410237f9e",
+        "88fe44b2-64fd-426d-a223-b489deb21ea9"
+      ]
+    },
+    {
+      "agentId": "8f5f5d83-d9bc-494d-a9fd-21b45e444082",
+      "botTokenRef": "<secret uuid>",
+      "channelId": "1553316432522121276",
+      "alsoForAgentIds": [
+        "6d280c11-c807-4d64-b29c-44ce51c27faa",
+        "6d3d4ae8-a057-4916-84e7-efca5a561072",
+        "1d51740d-14c0-4c5a-ac89-87b7935b5cf5"
+      ]
+    },
+    {
+      "agentId": "88655af5-1d83-4593-9f92-8b1a6d9f5c22",
+      "botTokenRef": "<secret uuid>",
+      "channelId": "1553320206552666112",
+      "alsoForAgentIds": ["8d17cab4-247c-4fd6-b6cf-2168ecf45888"]
+    }
+  ]
+}
+```
+
+The four entries above: Emery (no workers listed); Aspen, also for Atlas and
+Atom; Coda, also for Clay, Quinn, and Rowan; Darcey, also for Virginia.
+
+Two entries resolving to the same bot token share one Gateway connection
+(logged, not a second connection). An agent ID named in more than one entry —
+as a lead or under `alsoForAgentIds`, anywhere in the list — is a config
+error: the first entry to name it wins, and the rest are logged and dropped.
+
+**One person can talk to the bots, and this fails closed.** `hannaDiscordUserId`
+is a Discord user ID. Every inbound path — typed replies, button clicks, slash
+commands, voice — drops any author who does not match it. Left unset, every
+author is dropped, on every path: this is required, not opt-in, and the plugin
+reports itself degraded (`discord-inbound-disabled`) and logs it once per
+configuration delivery until it is set.
+
+**A reply wakes the assignee, and an issue in review or blocked wakes Hanna.**
+A typed reply becomes a Paperclip board comment, and the board comment itself
+wakes the assignee — Paperclip wakes the assignee on any non-self comment
+while the issue is open, no mention needed. Separately, when an issue moves to
+`in_review` or `blocked` and is assigned to `local-board`, the assignee's bot
+posts the ask and mentions
+Hanna — this is the only event that ever mentions her.
+
+**`/ask` always goes to Emery.** It creates a `todo` issue assigned to Emery,
+recording the named agent on the issue, rather than creating an issue for that
+agent directly.
+
+**Removed:** `discuss_with_agent`, `handoff_to_agent` (agent-to-agent tools),
+`register_custom_command`, `register_watch`, the workflow engine's
+`create_issue` and `invoke_agent` steps, and `/acp spawn`. These let one agent
+start or hand off work to another with no human in the loop, which is what
+caused a runaway in an earlier version of the fleet. None of their tool
+registrations exist in this fork, so no agent can call them.
+
+**Voice input, local only.** Speech-to-text runs on the host machine with
+Whisper (whisper.cpp), not a cloud service. See
+[Voice transcription setup](#voice-transcription-setup) for the prerequisites
+and [Where a spoken utterance goes](#where-a-spoken-utterance-goes) for the
+routing rules, both rewritten for this fork.
+
 ## Why this exists
 
 Multiple Paperclip users asked for notifications on the same day the plugin system shipped (2026-03-14):
@@ -57,10 +150,12 @@ This is that plugin.
 - `/clip commands list` - List registered workflow commands
 - `/clip commands run <name> [args]` - Execute a workflow command
 - `/clip commands delete <name>` - Delete a workflow command
-- `/acp spawn agent:<name> task:<description>` - Start a new agent session in a Discord thread
 - `/acp status session:<id>` - Check ACP session status
 - `/acp cancel session:<id>` - Cancel a running ACP session
 - `/acp close session:<id>` - Close a completed ACP session and archive the thread
+- `/ask agent:<name> text:<what you want done>` - **This fork.** Creates a `todo` issue assigned to Emery, recording `agent` on the issue. Never creates an issue for the named agent directly — the v2 lifecycle expects new work to enter through Emery, who scopes it.
+
+**Removed in this fork:** `/acp spawn agent:<name> task:<description>`, which started a new agent session directly, with no human in the loop.
 
 ### Community intelligence
 - Role-weighted signal extraction from Discord channels (every 6 hours)
@@ -154,12 +249,20 @@ This is that plugin.
 
 ### Voice transcription (optional, opt-in)
 - The bot joins one voice channel and transcribes what is said there (inbound only — it never speaks)
-- Each utterance goes to Paperclip through the same inbound ingress a typed reply uses — routed to whatever its channel is currently about, or to a configured default — and is also posted into a text channel by webhook so the room can see what was heard
+- Each utterance goes to Paperclip through the same inbound ingress a typed reply uses — routed to the issue of the thread Hanna last replied in, or to a standing voice-inbox issue — and is also posted into a text channel by webhook so the room can see what was heard
 - The webhook post is **display only** — nothing reads it back, so a transcript cannot loop and no webhook is ever a trusted input source
-- Speech-to-text via Deepgram; end-of-utterance is 800 ms of silence
-- Off unless four environment variables are set, and it rides the plugin's existing gateway connection — no second Discord connection
+- Speech-to-text runs locally with Whisper (whisper.cpp); no audio leaves the machine, and the plugin never reads a Deepgram (or any other cloud STT) API key
+- End-of-utterance is 800 ms of silence
+- Off unless three environment variables are set (the fourth, an API key, is gone — Whisper needs no key), and it rides the plugin's existing gateway connection — no second Discord connection
 - Joins on the gateway's own READY/RESUMED boundary, and rejoins there after a reconnect
 - Requires [optional dependencies](#voice-transcription-setup) that are **not** installed by default
+
+### Voice messages (optional, opt-in)
+- Hanna can record a voice message in Discord and send it as a reply in an issue's thread
+- The plugin downloads the attachment (bounded to 25 MB), transcribes it with the same local Whisper transcriber, and posts a comment carrying the transcript and a link to the audio
+- The comment reaches Paperclip through the same ingress a typed reply uses
+- The `hannaDiscordUserId` allowlist applies before anything is downloaded; a non-audio attachment is ignored, and the message's own typed text (if any) is used instead
+- Only an attachment whose content type starts with `audio/`, or one Discord itself flags as a voice message, qualifies
 
 ## Install
 
@@ -228,9 +331,16 @@ Before filing a bug, confirm which Paperclip host this plugin is actually talkin
 | `enableMediaPipeline` | No | Detect and process media attachments (default: false) |
 | `mediaChannelIds` | No | Channel IDs to monitor for media (empty = all) |
 | `enableCustomCommands` | No | Allow agents to register !commands (default: false) |
-| `enableProactiveSuggestions` | No | Allow agents to register watch conditions (default: false) |
+| `enableProactiveSuggestions` | No | Allow agents to register watch conditions (default: false) — **removed in this fork**, no tool exists to set one |
 | `proactiveScanIntervalMinutes` | No | How often to check watches (default: 15, min: 5, max: 60) |
 | `paperclipBaseUrl` | No | Base URL for Paperclip API calls (default: http://localhost:3100) |
+| `agentBots` | No | This fork. One Discord bot per lead agent: `{ agentId, botTokenRef, channelId, alsoForAgentIds? }[]`. An outbound notification posts through the assignee's bot — its own lead entry, or the lead entry naming it under `alsoForAgentIds` — falling back to `discordBotTokenRef` for anyone not listed. Empty by default (upstream's single-bot behavior). See the config example above |
+| `hannaDiscordUserId` | **Yes, for inbound** | This fork. A Discord user ID. Every inbound path drops any author who does not match it. Unset drops EVERY author (fails closed), reports plugin health degraded, and logs it once per configuration delivery — it does not fall back to upstream's unrestricted behavior |
+| `whisperBinaryPath` | No | This fork. Path to the whisper.cpp `whisper-cli` binary (default: `/opt/homebrew/bin/whisper-cli`) |
+| `ffmpegPath` | No | This fork. Path to `ffmpeg`, used to resample audio to the WAV whisper-cli expects (default: `/opt/homebrew/bin/ffmpeg`) |
+| `whisperModelPath` | No | This fork. Path to the ggml Whisper model file (default: `~/.cache/whisper/ggml-large-v3-turbo-q8_0.bin`); `~` expands to the current user's home |
+| `whisperLanguage` | No | This fork. Language code passed to whisper-cli (default: `en`) |
+| `voiceInboxIssueId` | No | This fork. The standing Paperclip issue a live-voice utterance routes to when there is no thread Hanna last replied in. Leave empty and the plugin creates one, titled "Hanna voice inbox", assigned to Emery, and remembers its ID |
 
 ### Voice transcription setup
 
@@ -246,6 +356,16 @@ npm install @discordjs/voice prism-media opusscript@0.0.8 libsodium-wrappers ws
 
 `prism-media` ships no Opus codec of its own — it needs one of `opusscript`, `@discordjs/opus`, `node-opus` or `ffmpeg-static` to decode incoming audio. `opusscript` is pure JavaScript and needs no native build, so it is the recommended default; `@discordjs/opus` is faster but compiles a native module. Without an engine the plugin refuses to start voice and logs the install command, rather than joining the channel and silently transcribing nothing.
 
+#### Whisper prerequisites (this fork)
+
+Speech-to-text runs locally. Install these on the machine the plugin worker runs on — not as npm packages:
+
+1. **whisper.cpp**, via Homebrew: `brew install whisper-cpp`. This installs the `whisper-cli` binary.
+2. **ffmpeg**, via Homebrew: `brew install ffmpeg`. The plugin uses it to resample audio to the 16 kHz mono WAV `whisper-cli` reads.
+3. **The model file**, downloaded once, by hand. This fork was built and measured against the quantized large-v3-turbo model, `ggml-large-v3-turbo-q8_0.bin`, from the [ggerganov/whisper.cpp models on Hugging Face](https://huggingface.co/ggerganov/whisper.cpp). Save it wherever you like and point `whisperModelPath` at it — the default expects `~/.cache/whisper/ggml-large-v3-turbo-q8_0.bin`.
+
+None of this needs an API key, an account, or a network call at transcription time. If `whisper-cli`, `ffmpeg`, or the model file cannot be found at the configured paths, transcription fails for that one utterance or voice message — logged, not silent — and text routing is unaffected.
+
 Then set these environment variables on the plugin worker:
 
 | Variable | Required | Description |
@@ -253,46 +373,49 @@ Then set these environment variables on the plugin worker:
 | `DISCORD_VOICE_GUILD_ID` | Yes | Guild (server) ID containing the voice channel |
 | `DISCORD_VOICE_CHANNEL_ID` | Yes | Voice channel the bot joins on startup |
 | `DISCORD_VOICE_WEBHOOK_URL` | Yes | Webhook URL of the text channel transcripts are posted to |
-| `DEEPGRAM_API_KEY` | Yes | Deepgram API key for streaming speech-to-text |
 | `DISCORD_VOICE_USERNAME` | No | Webhook display name for transcripts (default: `Voice`) |
-| `DISCORD_VOICE_DEFAULT_ISSUE_ID` | No | Fallback Paperclip issue for spoken utterances, used when the transcript channel has no target of its own. |
 
-If any of the four required variables is missing, voice initializes nothing and the plugin runs exactly as before. Voice startup and shutdown are both wrapped: a voice failure is logged, reported through plugin health, and never crashes the plugin or interrupts text routing.
+If any of the three required variables is missing, the live `#talk` voice channel initializes nothing and the plugin runs exactly as before. Voice messages (a reply with an audio attachment) do not depend on these three variables at all — see [Voice messages](#voice-messages-optional-opt-in) — and work whenever the whisper binary, ffmpeg, and model are reachable at their configured paths. Voice startup and shutdown are both wrapped: a voice failure is logged, reported through plugin health, and never crashes the plugin or interrupts text routing.
+
+Whisper's own paths — `whisperBinaryPath`, `ffmpegPath`, `whisperModelPath`, `whisperLanguage` — are plugin config, not environment variables. See the [Configuration](#configuration) table above for their defaults.
 
 ### Where a spoken utterance goes
 
 A voice utterance is not a reply to anything, so it has no message to inherit a
 destination from. Two destinations are tried, in order:
 
-1. **What the transcript's channel is currently about.** Every time the plugin
-   posts a notification into a channel it records what that notification was
-   about, and a spoken utterance follows that pointer.
-2. **`DISCORD_VOICE_DEFAULT_ISSUE_ID`**, when the channel has no pointer yet.
+1. **The issue of the thread Hanna last replied in.** A typed reply, or a
+   voice message (see above), records which issue it commented on. The next
+   spoken utterance in `#talk` goes there. A live utterance never counts as a
+   reply itself, so it can never become its own target.
+2. **The standing voice inbox**, when there is no such thread yet.
+   `voiceInboxIssueId` names it directly when set. Left empty, the plugin
+   creates one issue, titled "Hanna voice inbox", assigned to the agent named
+   Emery — the same way `/ask` assigns new work — the first time it is
+   needed, and remembers its ID in plugin state so it is never created twice.
 
 Either way the utterance is commented on the resolved issue under the company
 that owns this install, through the same ingress and the same API call a typed
 reply uses, authored `discord:voice:<userId>`.
 
-With neither available — no notification has been posted in that channel and no
-default configured — voice runs **display-only**: it still transcribes and still
-posts to the text channel, but sends nothing to Paperclip, and plugin health
-says so. The same is true for an utterance whose destination Paperclip rejects
-(the issue was deleted, say): the transcript still shows, health reports it, and
-nothing else in the plugin is affected.
+With neither available — no reply has happened yet, and the inbox could not be
+created (Emery could not be found, say) — voice runs **display-only**: it
+still transcribes and still posts to the text channel, but sends nothing to
+Paperclip, and plugin health says so. The same is true for an utterance whose
+destination Paperclip rejects (the issue was deleted, say): the transcript
+still shows, health reports it, and nothing else in the plugin is affected.
 
-**Known phase-1 property:** the channel pointer is *last-notification-wins*. It
-follows the most recent thing the plugin announced in that channel, not what the
-room is actually discussing, so a notification arriving mid-conversation moves
-where the next utterance lands. Set `DISCORD_VOICE_DEFAULT_ISSUE_ID` and use a
-channel the plugin does not post into if you want a fixed destination. A
-genuinely conversation-scoped target needs state voice does not have yet.
+This replaces upstream's channel-level pointer, which followed whichever
+notification the plugin posted into a channel most recently — a room's actual
+conversation, not the plugin's own most recent post, decides the destination
+now.
 
-A pointer is only ever followed for the company that currently owns the install.
-Ownership can move between installs, and a pointer left behind by a previous
-owner is ignored rather than allowed to file a transcript under the wrong
-company. The same rule covers slow work: an utterance still being transcribed
-when ownership moves is dropped rather than filed under whoever owns the install
-by the time it finishes.
+The last-replied-thread pointer, and the voice inbox's cached ID, are only
+ever read for the company that currently owns the install. Ownership can move
+between installs, and state left behind by a previous owner is never read
+across that boundary. The same rule covers slow work: an utterance still being
+transcribed when ownership moves is dropped rather than filed under whoever
+owns the install by the time it finishes.
 
 To find the pointer, the plugin has to know which channel the webhook posts
 into, which a webhook URL does not carry — so it asks Discord for the webhook
@@ -318,7 +441,7 @@ Notes:
 - Enabling voice adds the `GUILD_VOICE_STATES` intent to the gateway IDENTIFY. Intents are fixed when the socket identifies, so turning voice on or off reconnects the gateway.
 - Voice joins when the gateway reaches READY or RESUMED, never before: a voice-state update sent to a socket that has not identified is not deliverable, and a join that could not be sent is not retried by `@discordjs/voice`.
 - Transcripts are posted with `allowed_mentions: { parse: [] }`. Speech recognition will happily render "at everyone" as `@everyone`, so no transcript can ever ping anyone — the text is preserved verbatim, but Discord resolves no mentions in it.
-- Audio is sent to Deepgram for transcription. Tell the people in the channel.
+- Audio is transcribed locally, on the machine the plugin worker runs on. No audio leaves the machine. Tell the people in the channel that the room is transcribed either way.
 
 Not in this phase: text-to-speech output, per-agent voices, cost guards.
 
@@ -328,10 +451,14 @@ Not in this phase: text-to-speech output, per-agent voices, cost guards.
 |------|-------|-------------|
 | `escalate_to_human` | 1 | Escalate a conversation to a human via Discord |
 | `discord_signals` | - | Query community intelligence signals |
-| `handoff_to_agent` | 2 | Hand off a thread to another agent (requires human approval) |
-| `discuss_with_agent` | 2 | Start a multi-turn agent-to-agent discussion |
-| `register_custom_command` | 4 | Register a !command for Discord users |
-| `register_watch` | 5 | Register a watch condition for proactive suggestions |
+
+Upstream also registers `handoff_to_agent` (2, hand off to another agent),
+`discuss_with_agent` (2, multi-turn agent-to-agent discussion),
+`register_custom_command` (4, register a `!command`), and `register_watch` (5,
+register a proactive-suggestion watch). **None of these four are registered in
+this fork.** They let one agent start or hand off work to another with no
+human in the loop; no agent running under this fork can call them, because the
+registrations do not exist.
 
 ## Credits
 
@@ -379,7 +506,7 @@ pnpm test
 pnpm build
 ```
 
-323 tests covering formatters, commands, intelligence, session registry, media pipeline, custom commands, proactive suggestions, retry logic, workflow engine, and Telegram-parity features.
+737 tests (one skipped unless `WHISPER_INTEGRATION=1`) covering formatters, commands, intelligence, session registry, media pipeline, custom commands, proactive suggestions, retry logic, workflow engine, Telegram-parity features, and this fork's agent bot map (including alsoForAgentIds), author allowlist, wake-on-reply, local Whisper transcription, voice messages, and voice-inbox routing.
 
 ## Contributing
 

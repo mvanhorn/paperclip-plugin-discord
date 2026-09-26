@@ -9,7 +9,7 @@
 
 export { VoiceClient, assertOpusEngineAvailable, VOICE_DEPS_INSTALL_HINT } from "./client.js";
 export { createPluginDiscordAdapter } from "./discord-adapter.js";
-export { DeepgramSTTAdapter } from "./stt-deepgram.js";
+export { WhisperSTTAdapter } from "./stt-whisper.js";
 export { WebhookTextChannelRelay, NO_MENTIONS } from "./text-channel-relay.js";
 export { DEFAULT_RELAY_USERNAME } from "./types.js";
 export type {

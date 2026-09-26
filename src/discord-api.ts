@@ -24,6 +24,8 @@ export interface DiscordMessage {
   content?: string;
   embeds?: DiscordEmbed[];
   components?: DiscordComponent[];
+  /** Discord's allowed_mentions object. `{ parse: [] }` resolves no mention, so no push. */
+  allowed_mentions?: { parse: Array<"users" | "roles" | "everyone"> };
 }
 
 export interface DiscordGuildRole {
@@ -133,6 +135,7 @@ export async function postEmbedWithId(
             content: message.content,
             embeds: message.embeds,
             components: message.components,
+            allowed_mentions: message.allowed_mentions,
           },
         },
       );

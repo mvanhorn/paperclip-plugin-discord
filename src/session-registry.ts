@@ -1107,28 +1107,10 @@ export async function handleAcpCommand(
   }
 
   switch (subcommand.name) {
-    case "spawn": {
-      const agentName = getOption(subcommand.options, "agent");
-      const task = getOption(subcommand.options, "task");
-      if (!agentName || !task) {
-        return respondToInteraction({ type: 4, content: "Usage: `/acp spawn agent:<name> task:<description>`", ephemeral: true });
-      }
-
-      const threadId = await createAgentThread(ctx, token, defaultChannelId, agentName, task, companyId);
-      if (!threadId) {
-        return respondToInteraction({ type: 4, content: "Failed to create Discord thread.", ephemeral: true });
-      }
-
-      const result = await spawnAgentInThread(ctx, token, threadId, agentName, companyId, task);
-      if (!result.ok) {
-        return respondToInteraction({ type: 4, content: result.error ?? "Failed to spawn agent.", ephemeral: true });
-      }
-
-      return respondToInteraction({
-        type: 4,
-        content: `Spawned **${agentName}** in thread.`,
-      });
-    }
+    // "spawn" is removed (plan item 6): no command starts a new agent
+    // session from Discord. `createAgentThread`/`spawnAgentInThread` stay —
+    // the handoff-approval flow still spawns a target agent in a thread —
+    // but nothing reachable from a slash command does.
 
     case "status": {
       const sessionId = getOption(subcommand.options, "session");

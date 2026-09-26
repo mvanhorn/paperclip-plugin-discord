@@ -184,7 +184,7 @@ describe("/clip agents", () => {
 // ---------------------------------------------------------------------------
 
 describe("/clip help", () => {
-  it("lists all commands including /clip and /acp", async () => {
+  it("lists all commands including /clip, /acp, and /ask", async () => {
     const ctx = makeCtx();
     const result = (await handleInteraction(ctx, clipInteraction("help"), defaultCmdCtx)) as any;
     expect(result.type).toBe(4);
@@ -196,10 +196,13 @@ describe("/clip help", () => {
     expect(desc).toContain("/clip connect");
     expect(desc).toContain("/clip digest");
     expect(desc).toContain("/clip commands");
-    expect(desc).toContain("/acp spawn");
+    // /acp spawn is removed (plan item 6): no command starts a new agent
+    // session from Discord.
+    expect(desc).not.toContain("/acp spawn");
     expect(desc).toContain("/acp status");
     expect(desc).toContain("/acp cancel");
     expect(desc).toContain("/acp close");
+    expect(desc).toContain("/ask");
   });
 });
 
@@ -578,7 +581,7 @@ describe("/clip commands list", () => {
     ctx.state.get.mockResolvedValue({
       workflows: {
         greet: { name: "greet", steps: [{ type: "send_message" }], createdAt: "2026-01-15T00:00:00Z", description: "Say hi" },
-        deploy: { name: "deploy", steps: [{ type: "invoke_agent" }, { type: "send_message" }], createdAt: "2026-02-01T00:00:00Z" },
+        deploy: { name: "deploy", steps: [{ type: "http_request" }, { type: "send_message" }], createdAt: "2026-02-01T00:00:00Z" },
       },
     });
 

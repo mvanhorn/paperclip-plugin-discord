@@ -30,8 +30,6 @@ export interface VoiceClientConfig {
   voiceChannelId: string;
   /** Webhook URL of the text channel that transcripts are posted to. */
   textChannelWebhookUrl: string;
-  /** Deepgram API key. */
-  deepgramApiKey: string;
   /** Webhook display name for relayed transcripts. Default: "Voice". */
   relayUsername?: string;
   /** Silence duration (ms) that ends an utterance. Default: 800. */
@@ -44,6 +42,13 @@ export interface VoiceClientConfig {
    * `GatewayVoiceHandle.onGatewayReady` in src/gateway.ts.
    */
   onGatewayReady: (handler: () => void) => () => void;
+  /**
+   * Whether a speaker is worth listening to at all, checked BEFORE
+   * subscribing to their audio, decoding it, or transcribing it — a speaker
+   * this rejects is never recorded, never sent to Whisper, and never posted
+   * to the text channel. Omit to process every speaker (unchanged default).
+   */
+  isAllowedSpeaker?: (userId: string) => boolean;
   /**
    * Hand a finished utterance to the plugin's inbound ingress. This is the ONLY
    * path by which a spoken utterance reaches Paperclip: the webhook post is

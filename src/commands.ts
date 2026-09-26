@@ -4,7 +4,7 @@ import { COLORS, METRIC_NAMES } from "./constants.js";
 import { humanizeStatus } from "./formatters.js";
 import { withRetry, throwOnRetryableStatus } from "./retry.js";
 import { paperclipFetch } from "./paperclip-fetch.js";
-import { handleHandoffButton, handleDiscussionButton, handleAcpCommand } from "./session-registry.js";
+import { handleAcpCommand } from "./session-registry.js";
 import { resolveCompanyId } from "./company-resolver.js";
 import { getEscalation } from "./escalation-state.js";
 import {
@@ -268,25 +268,9 @@ export const SLASH_COMMANDS = [
     name: "acp",
     description: "Manage coding agent sessions via Agent Client Protocol",
     options: [
-      {
-        name: "spawn",
-        description: "Start a new coding agent session in a thread",
-        type: 1,
-        options: [
-          {
-            name: "agent",
-            description: "Agent name to spawn",
-            type: 3,
-            required: true,
-          },
-          {
-            name: "task",
-            description: "Task description for the agent",
-            type: 3,
-            required: true,
-          },
-        ],
-      },
+      // "spawn" is removed (plan item 6): no command starts a new agent
+      // session, coding or otherwise, from Discord — the v1 runaway came
+      // from agents (and now, commands) waking agents.
       {
         name: "status",
         description: "Check the status of an ACP session",
@@ -325,6 +309,24 @@ export const SLASH_COMMANDS = [
             required: true,
           },
         ],
+      },
+    ],
+  },
+  {
+    name: "ask",
+    description: "Start new work: creates a todo issue for Emery to scope",
+    options: [
+      {
+        name: "agent",
+        description: "Which agent this ask is about (recorded on the issue; Emery still scopes it)",
+        type: 3,
+        required: true,
+      },
+      {
+        name: "text",
+        description: "What you want done",
+        type: 3,
+        required: true,
       },
     ],
   },
@@ -381,14 +383,18 @@ async function handleSlashCommand(
     );
   }
 
+  if (data.name === "ask") {
+    return handleAsk(ctx, cmdCtx, data, companyId);
+  }
+
   // Ignore slash commands not owned by this plugin. The Discord bot token may be
   // shared with other applications (e.g. OpenClaw's discord plugin handles /status,
   // /agents, etc.), and Discord delivers INTERACTION_CREATE to every connected
   // client on the gateway. Without this guard, non-/clip commands fall through to
   // the "Missing subcommand" branch below and respond with a misleading
   // "Try `/clip status`" message, effectively hijacking the other plugin's reply.
-  // This plugin owns "/clip" (and "/acp", handled above); everything else is
-  // someone else's responsibility.
+  // This plugin owns "/clip" (and "/acp" and "/ask", handled above); everything
+  // else is someone else's responsibility.
   if (data.name !== "clip") {
     return;
   }
@@ -446,6 +452,74 @@ async function handleSlashCommand(
         content: `Unknown command: ${subName}`,
         ephemeral: true,
       });
+  }
+}
+
+/**
+ * `/ask <agent> <text>`. The v2 lifecycle expects new work to enter through
+ * Emery, who scopes it — this never creates an issue for the named agent
+ * directly, only records that name on the issue so Emery has the context.
+ */
+async function handleAsk(
+  ctx: PluginContext,
+  cmdCtx: CommandContext | undefined,
+  data: InteractionData,
+  companyId: string,
+): Promise<unknown> {
+  const agentName = getOption(data.options, "agent");
+  const text = getOption(data.options, "text");
+  if (!agentName || !text) {
+    return respondToInteraction({
+      type: 4,
+      content: "Usage: `/ask agent:<name> text:<what you want done>`",
+      ephemeral: true,
+    });
+  }
+
+  const baseUrl = cmdCtx?.baseUrl ?? "http://localhost:3100";
+  const apiKey = cmdCtx?.paperclipBoardApiKey ?? "";
+
+  try {
+    const agents = (await ctx.agents.list({ companyId })) as Array<{ id: string; name: string }>;
+    const emery = agents.find((a) => a.name === "Emery" || a.name.toLowerCase() === "emery");
+    if (!emery) {
+      ctx.logger.warn("/ask could not find Emery among this company's agents", { companyId });
+      return respondToInteraction({
+        type: 4,
+        content: "Could not find Emery in this company's agents — new work needs Emery to scope it.",
+        ephemeral: true,
+      });
+    }
+
+    const title = `Ask for ${agentName}: ${text}`.slice(0, 200);
+    const response = await withRetry(async () => {
+      const r = await paperclipFetch(`${baseUrl}/api/companies/${companyId}/issues`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title,
+          description: text,
+          status: "todo",
+          assigneeAgentId: emery.id,
+        }),
+      }, apiKey);
+      throwOnRetryableStatus(r);
+      return r;
+    });
+
+    const issue = (await response.json()) as { id?: string; identifier?: string };
+    ctx.logger.info("/ask created a todo issue for Emery", { issueId: issue.id, agentName, companyId });
+    return respondToInteraction({
+      type: 4,
+      content: `Created ${issue.identifier ?? issue.id ?? "the issue"} for Emery to scope.`,
+    });
+  } catch (err) {
+    ctx.logger.error("/ask failed to create an issue", { agentName, error: String(err) });
+    return respondToInteraction({
+      type: 4,
+      content: `Could not create the issue — ${err instanceof Error ? err.message : String(err)}`,
+      ephemeral: true,
+    });
   }
 }
 
@@ -945,10 +1019,11 @@ function handleHelp(): unknown {
     "`/clip commands delete <name>` — Delete a workflow command",
     "`/clip help` — Show this help message",
     "",
-    "`/acp spawn <agent> <task>` — Start an agent session in a thread",
     "`/acp status <session>` — Check session status",
     "`/acp cancel <session>` — Cancel a session",
     "`/acp close <session>` — Close and archive a session thread",
+    "",
+    "`/ask <agent> <text>` — Start new work; creates a todo issue for Emery to scope",
   ];
 
   const embeds: DiscordEmbed[] = [
@@ -1272,12 +1347,18 @@ async function handleButtonClick(
     return handleEscalationButton(ctx, customId, actor, base);
   }
 
-  if (customId.startsWith("handoff_")) {
-    return handleHandoffButton(ctx, token, customId, actor);
-  }
-
-  if (customId.startsWith("disc_")) {
-    return handleDiscussionButton(ctx, token, customId, actor);
+  // Security review A5: the tools that create a handoff or a discussion
+  // record (handoff_to_agent, discuss_with_agent) are already removed (plan
+  // item 6). Leaving the button-click acceptance path live was its own
+  // residual agent-to-agent surface, so neither is dispatched to at all —
+  // handleHandoffButton and handleDiscussionButton (session-registry.ts)
+  // stay only for their own direct unit coverage in handoff.test.ts.
+  if (customId.startsWith("handoff_") || customId.startsWith("disc_")) {
+    return respondToInteraction({
+      type: 4,
+      content: "This action is no longer available: agent-to-agent handoffs and discussions were removed.",
+      ephemeral: true,
+    });
   }
 
   if (customId.startsWith("wf_approve_") || customId.startsWith("wf_reject_")) {

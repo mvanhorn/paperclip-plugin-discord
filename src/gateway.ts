@@ -60,9 +60,20 @@ interface InteractionCreateEvent {
   token: string;
   type: number;
   data?: Record<string, unknown>;
-  member?: { user: { username: string } };
+  // `id` is part of Discord's real payload; it was left off this type until the
+  // author allowlist needed it (worker.ts's `interactionAuthorId`).
+  member?: { user: { id?: string; username: string } };
   guild_id?: string;
   channel_id?: string;
+}
+
+/** One file attached to a message, as Discord's MESSAGE_CREATE payload carries it. */
+export interface DiscordMessageAttachment {
+  id: string;
+  filename: string;
+  url: string;
+  content_type?: string;
+  size: number;
 }
 
 export interface MessageCreateEvent {
@@ -75,6 +86,9 @@ export interface MessageCreateEvent {
     channel_id: string;
     guild_id?: string;
   };
+  attachments?: DiscordMessageAttachment[];
+  /** Message flags bitfield. Bit 1<<13 (8192) is Discord's IS_VOICE_MESSAGE. */
+  flags?: number;
 }
 
 /** VOICE_STATE_UPDATE dispatch payload (op 0, t = VOICE_STATE_UPDATE). */

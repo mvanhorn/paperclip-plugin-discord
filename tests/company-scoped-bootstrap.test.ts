@@ -98,6 +98,9 @@ function storedConfig(overrides: Record<string, unknown> = {}) {
     enableInbound: false,
     enableCommands: false,
     digestMode: "off",
+    // This file tests bootstrap/gateway mechanics, not the allowlist (see
+    // author-allowlist.test.ts) — configured so health stays "ok" here.
+    hannaDiscordUserId: "77777777-7777-7777-7777-777777777777",
     ...overrides,
   };
 }
@@ -886,15 +889,22 @@ describe("registration contract", () => {
       ]),
     );
 
+    // handoff_to_agent, discuss_with_agent, register_custom_command, and
+    // register_watch are removed in this fork (plan item 6: no tool lets an
+    // agent hand off to, discuss with, or register work for another agent).
     const toolNames = ctx.tools.register.mock.calls.map((call: any[]) => call[0]);
     expect(toolNames).toEqual(
       expect.arrayContaining([
         "escalate_to_human",
+        "discord_signals",
+      ]),
+    );
+    expect(toolNames).not.toEqual(
+      expect.arrayContaining([
         "handoff_to_agent",
         "discuss_with_agent",
         "register_custom_command",
         "register_watch",
-        "discord_signals",
       ]),
     );
 

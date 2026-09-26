@@ -20,6 +20,7 @@ const manifest: PaperclipPluginManifestV1 = {
   capabilities: [
     "companies.read",
     "projects.read",
+    "goals.read",
     "issues.read",
     "issue.comments.read",
     "issues.create",
@@ -285,6 +286,109 @@ const manifest: PaperclipPluginManifestV1 = {
         title: "Digest times for tridaily mode (comma-separated HH:MM UTC)",
         default: DEFAULT_CONFIG.tridailyTimes,
       },
+      agentBots: {
+        type: "array",
+        title: "Agent bot map",
+        description:
+          "One Discord bot per lead agent. An outbound notification about an issue posts " +
+          "through the assignee's bot — its own lead's entry, or the lead's entry that " +
+          "lists it under alsoForAgentIds — falling back to the discordBotTokenRef bot " +
+          "for anyone not listed. Leave empty to keep upstream's single-bot behavior.",
+        items: {
+          type: "object",
+          properties: {
+            agentId: { type: "string", title: "Lead agent ID" },
+            // Same Ajv note as discordBotTokenRef above: accepts both the settings
+            // picker's object binding and a bare secret UUID string, and carries no
+            // default so a fresh install never persists an empty-string secret ref.
+            botTokenRef: {
+              type: ["string", "object"],
+              format: "secret-ref",
+              title: "Bot token (secret reference)",
+              description: "This lead's Discord bot token, stored as a secret.",
+            },
+            channelId: { type: "string", title: "Channel ID" },
+            alsoForAgentIds: {
+              type: "array",
+              items: { type: "string" },
+              title: "Also posts for (worker agent IDs)",
+              description:
+                "Worker agent IDs whose outbound posts also go through this lead's bot and " +
+                "channel. Named explicitly; nothing here is looked up (e.g. reportsTo) at run time.",
+            },
+          },
+          required: ["agentId", "botTokenRef", "channelId"],
+        },
+        default: DEFAULT_CONFIG.agentBots,
+      },
+      hannaDiscordUserId: {
+        type: "string",
+        title: "Hanna's Discord user ID (required for inbound)",
+        description:
+          "Every inbound path (typed replies, button clicks, slash commands, " +
+          "voice) drops any author whose ID does not match this snowflake. " +
+          "This fails CLOSED: left empty, every author is dropped on every " +
+          "path — not upstream's unrestricted default — and the plugin " +
+          "reports itself degraded until this is set.",
+        default: DEFAULT_CONFIG.hannaDiscordUserId,
+      },
+      accomplishmentsChannelId: {
+        type: "string",
+        title: "Accomplishments Channel ID",
+        description:
+          "When a lead's issue (the agentId of an agentBots entry, not an alsoForAgentIds " +
+          "member) reaches done, the lead's bot posts one line here. No mention. " +
+          "Leave empty to post nothing.",
+        default: DEFAULT_CONFIG.accomplishmentsChannelId,
+      },
+      milestonesChannelId: {
+        type: "string",
+        title: "Milestones Channel ID",
+        description:
+          "When a goal reaches achieved or a project reaches completed, the bot of the " +
+          "goal's ownerAgentId or the project's leadAgentId posts one line here, else the " +
+          "discordBotTokenRef bot. No mention. Leave empty to post nothing.",
+        default: DEFAULT_CONFIG.milestonesChannelId,
+      },
+      whisperBinaryPath: {
+        type: "string",
+        title: "Whisper binary path",
+        description:
+          "Path to the whisper.cpp whisper-cli binary that transcribes voice locally. " +
+          "No audio ever leaves the machine.",
+        default: DEFAULT_CONFIG.whisperBinaryPath,
+      },
+      ffmpegPath: {
+        type: "string",
+        title: "ffmpeg path",
+        description:
+          "Path to ffmpeg, used to resample audio to the 16 kHz mono WAV whisper-cli expects.",
+        default: DEFAULT_CONFIG.ffmpegPath,
+      },
+      whisperModelPath: {
+        type: "string",
+        title: "Whisper model path",
+        description:
+          "Path to the ggml Whisper model file (large-v3 turbo, quantized). " +
+          "`~` expands to the current user's home directory.",
+        default: DEFAULT_CONFIG.whisperModelPath,
+      },
+      whisperLanguage: {
+        type: "string",
+        title: "Whisper language",
+        description: "Language code passed to whisper-cli.",
+        default: DEFAULT_CONFIG.whisperLanguage,
+      },
+      voiceInboxIssueId: {
+        type: "string",
+        title: "Voice inbox issue ID",
+        description:
+          "Standing Paperclip issue an utterance in the live voice channel routes to " +
+          "when there is no thread Hanna last replied in. Leave empty and the plugin " +
+          "creates one automatically, titled \"Hanna voice inbox\", assigned to Emery, " +
+          "and remembers its ID.",
+        default: DEFAULT_CONFIG.voiceInboxIssueId,
+      },
     },
     required: ["discordBotTokenRef", "defaultChannelId"],
   },
@@ -367,75 +471,11 @@ const manifest: PaperclipPluginManifestV1 = {
         required: ["companyId", "agentName", "reason"],
       },
     },
-    {
-      name: "handoff_to_agent",
-      displayName: "Handoff to Agent",
-      description: "Hand off a conversation to another agent. Requires human approval.",
-      parametersSchema: {
-        type: "object",
-        properties: {
-          threadId: { type: "string", description: "Discord thread ID" },
-          fromAgent: { type: "string", description: "Agent initiating the handoff" },
-          toAgent: { type: "string", description: "Target agent name" },
-          reason: { type: "string", description: "Reason for the handoff" },
-          context: { type: "string", description: "Context to pass to target agent" },
-        },
-        required: ["threadId", "fromAgent", "toAgent", "reason"],
-      },
-    },
-    {
-      name: "discuss_with_agent",
-      displayName: "Discuss with Agent",
-      description: "Start a multi-turn discussion between two agents with human checkpoints.",
-      parametersSchema: {
-        type: "object",
-        properties: {
-          threadId: { type: "string", description: "Discord thread ID" },
-          initiator: { type: "string", description: "Agent starting the discussion" },
-          target: { type: "string", description: "Agent to discuss with" },
-          topic: { type: "string", description: "Topic or question" },
-          maxTurns: { type: "number", description: "Max turns (default 10, max 50)" },
-          humanCheckpointInterval: { type: "number", description: "Pause every N turns (0 = none)" },
-        },
-        required: ["threadId", "initiator", "target", "topic"],
-      },
-    },
-    {
-      name: "register_custom_command",
-      displayName: "Register Custom Command",
-      description: "Register a custom command that Discord users can invoke via !command.",
-      parametersSchema: {
-        type: "object",
-        properties: {
-          companyId: { type: "string", description: "Company ID" },
-          command: { type: "string", description: "Command name (without leading !)" },
-          description: { type: "string", description: "Description of the command" },
-          parameters: {
-            type: "array",
-            items: { type: "object", properties: { name: { type: "string" }, description: { type: "string" }, required: { type: "boolean" } } },
-            description: "Command parameters",
-          },
-        },
-        required: ["companyId", "command", "description"],
-      },
-    },
-    {
-      name: "register_watch",
-      displayName: "Register Watch",
-      description: "Register a watch condition that fires proactive suggestions when matched.",
-      parametersSchema: {
-        type: "object",
-        properties: {
-          companyId: { type: "string", description: "Company ID" },
-          watchName: { type: "string", description: "Watch name" },
-          patterns: { type: "array", items: { type: "string" }, description: "Regex patterns to match" },
-          channelIds: { type: "array", items: { type: "string" }, description: "Channel IDs to watch (empty = all)" },
-          responseTemplate: { type: "string", description: "Template for the suggestion message" },
-          cooldownMinutes: { type: "number", description: "Min minutes between triggers (default 60)" },
-        },
-        required: ["companyId", "watchName", "patterns", "responseTemplate"],
-      },
-    },
+    // handoff_to_agent, discuss_with_agent, register_custom_command, and
+    // register_watch are removed (plan item 6): the v1 runaway came from
+    // agents waking agents, so no tool registration lets an agent hand off
+    // to, discuss with, or spawn work for another agent, or register a new
+    // custom command or watch. See src/worker.ts for what stays behind them.
   ],
   webhooks: [
     {

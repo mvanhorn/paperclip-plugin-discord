@@ -604,8 +604,14 @@ describe("escalation button clicks", () => {
   });
 });
 
-describe("handoff button clicks", () => {
-  it("parses handoff_approve_ and spawns target agent", async () => {
+describe("handoff and discussion button clicks are refused (security review A5)", () => {
+  // handleHandoffButton and handleDiscussionButton (session-registry.ts) are
+  // no longer dispatched to at all: the tools that created these records are
+  // already gone (plan item 6), and leaving the button-click path live was
+  // flagged as a residual agent-to-agent surface. handoff.test.ts still
+  // covers those functions directly, in isolation; this only asserts the
+  // dispatcher no longer reaches them.
+  it("refuses a handoff_approve_ click without touching state or spawning anything", async () => {
     const ctx = makeCtx({
       state: {
         get: vi.fn().mockImplementation(({ stateKey }: { stateKey: string }) => {
@@ -621,9 +627,6 @@ describe("handoff button clicks", () => {
               status: "pending",
               createdAt: "2026-03-15T12:00:00Z",
             });
-          }
-          if (stateKey.startsWith("sessions_")) {
-            return Promise.resolve({ sessions: [] });
           }
           return Promise.resolve(null);
         }),
@@ -650,34 +653,14 @@ describe("handoff button clicks", () => {
       defaultCmdCtx,
     ) as any;
 
-    expect(result.type).toBe(7);
-    expect(result.data.embeds[0].title).toContain("Approved");
-    expect(result.data.embeds[0].description).toContain("AgentB");
+    expect(result.type).toBe(4);
+    expect(result.data.content.toLowerCase()).toContain("no longer available");
+    expect(ctx.state.set).not.toHaveBeenCalled();
+    expect(ctx.agents.sessions.create).not.toHaveBeenCalled();
   });
 
-  it("parses handoff_reject_ and keeps original agent", async () => {
-    const ctx = makeCtx({
-      state: {
-        get: vi.fn().mockImplementation(({ stateKey }: { stateKey: string }) => {
-          if (stateKey.startsWith("handoff_")) {
-            return Promise.resolve({
-              handoffId: "hoff456",
-              threadId: "thread-1",
-              fromAgent: "AgentA",
-              toAgent: "AgentB",
-              toAgentId: "agent-b",
-              companyId: "default",
-              reason: "Not needed",
-              status: "pending",
-              createdAt: "2026-03-15T12:00:00Z",
-            });
-          }
-          return Promise.resolve(null);
-        }),
-        set: vi.fn().mockResolvedValue(undefined),
-      },
-    });
-
+  it("refuses a handoff_reject_ click", async () => {
+    const ctx = makeCtx();
     const result = await handleInteraction(
       ctx,
       {
@@ -688,12 +671,27 @@ describe("handoff button clicks", () => {
       defaultCmdCtx,
     ) as any;
 
-    expect(result.type).toBe(7);
-    expect(result.data.embeds[0].title).toContain("Rejected");
-    expect(result.data.embeds[0].description).toContain("AgentA");
+    expect(result.type).toBe(4);
+    expect(result.data.content.toLowerCase()).toContain("no longer available");
   });
 
-  it("returns not found for nonexistent handoff", async () => {
+  it("refuses a disc_continue_ click", async () => {
+    const ctx = makeCtx();
+    const result = await handleInteraction(
+      ctx,
+      {
+        type: 3,
+        data: { name: "button", custom_id: "disc_continue_abc123" },
+        member: { user: { username: "user" } },
+      },
+      defaultCmdCtx,
+    ) as any;
+
+    expect(result.type).toBe(4);
+    expect(result.data.content.toLowerCase()).toContain("no longer available");
+  });
+
+  it("refuses even a handoff_approve_ click naming a handoff that never existed", async () => {
     const ctx = makeCtx();
     const result = await handleInteraction(
       ctx,
@@ -706,7 +704,7 @@ describe("handoff button clicks", () => {
     ) as any;
 
     expect(result.type).toBe(4);
-    expect(result.data.content).toContain("not found");
+    expect(result.data.content.toLowerCase()).toContain("no longer available");
   });
 });
 
@@ -1070,8 +1068,8 @@ describe("autocomplete (interaction type 4)", () => {
 });
 
 describe("SLASH_COMMANDS", () => {
-  it("defines clip and acp commands", () => {
-    expect(SLASH_COMMANDS).toHaveLength(2);
+  it("defines clip, acp, and ask commands", () => {
+    expect(SLASH_COMMANDS).toHaveLength(3);
     const clip = SLASH_COMMANDS[0]!;
     expect(clip.name).toBe("clip");
     const subNames = clip.options.map((o) => o.name);
@@ -1079,6 +1077,10 @@ describe("SLASH_COMMANDS", () => {
 
     const acp = SLASH_COMMANDS[1]!;
     expect(acp.name).toBe("acp");
+
+    const ask = SLASH_COMMANDS[2]!;
+    expect(ask.name).toBe("ask");
+    expect(ask.options.map((o: any) => o.name)).toEqual(["agent", "text"]);
   });
 
   it("marks company options as autocomplete-enabled", () => {

@@ -192,7 +192,10 @@ describe("job handler registration vs manifest", () => {
     }
   });
 
-  it("check-watches handler early-returns when proactive suggestions disabled", async () => {
+  it("check-watches is fully inert, regardless of enableProactiveSuggestions (security review A5)", async () => {
+    // register_watch has no tool registration (plan item 6), but this job
+    // still evaluated whatever watch a PREVIOUS install had registered,
+    // invoking an agent with no human step. It now does nothing, unconditionally.
     const { registeredJobs, ctx } = await runSetup({
       enableProactiveSuggestions: false,
     });
@@ -200,10 +203,24 @@ describe("job handler registration vs manifest", () => {
     const handler = registeredJobs.get("check-watches")!;
     expect(handler).toBeDefined();
 
-    await handler();
-    expect(ctx.logger.debug).toHaveBeenCalledWith(
-      expect.stringContaining("proactive suggestions disabled"),
-    );
+    const fetchCallsBefore = (ctx.http.fetch as any).mock.calls.length;
+    await expect(handler()).resolves.toBeUndefined();
+    expect(ctx.logger.debug).toHaveBeenCalledWith(expect.stringContaining("retired"));
+    // No NEW fetch from running the handler itself (setup() may have made
+    // its own, unrelated calls before the handler ever ran).
+    expect((ctx.http.fetch as any).mock.calls.length).toBe(fetchCallsBefore);
+  });
+
+  it("check-watches stays inert even when enableProactiveSuggestions is true", async () => {
+    const { registeredJobs, ctx } = await runSetup({
+      enableProactiveSuggestions: true,
+    });
+
+    const handler = registeredJobs.get("check-watches")!;
+    const fetchCallsBefore = (ctx.http.fetch as any).mock.calls.length;
+    await expect(handler()).resolves.toBeUndefined();
+    expect(ctx.logger.debug).toHaveBeenCalledWith(expect.stringContaining("retired"));
+    expect((ctx.http.fetch as any).mock.calls.length).toBe(fetchCallsBefore);
   });
 
   it("discord-daily-digest handler early-returns when digest mode is off", async () => {

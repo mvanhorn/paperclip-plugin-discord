@@ -16,6 +16,7 @@ import {
   respondToInteraction,
   type DiscordEmbed,
   type DiscordComponent,
+  type DiscordMessage,
 } from "./discord-api.js";
 import {
   formatIssueCreated,
@@ -30,20 +31,26 @@ import {
 } from "./formatters.js";
 import { handleInteraction, SLASH_COMMANDS, type CommandContext } from "./commands.js";
 import { runIntelligenceScan, runBackfill } from "./intelligence.js";
-import { connectGateway, type GatewayHandle, type MessageCreateEvent } from "./gateway.js";
+import {
+  connectGateway,
+  type GatewayHandle,
+  type MessageCreateEvent,
+  type DiscordMessageAttachment,
+} from "./gateway.js";
+// Statically imported: stt-whisper.ts has no optional peer dependencies of its
+// own (unlike the rest of ./voice/, gated behind a dynamic import), so item 8's
+// voice-message path works even when live voice (#talk) is not configured.
+import { WhisperSTTAdapter } from "./voice/stt-whisper.js";
 import {
   handleAcpOutput,
   routeMessageToAgent,
   createAgentThread,
   spawnAgentInThread,
   closeAgentInThread,
-  initiateHandoff,
-  startDiscussion,
 } from "./session-registry.js";
 import { DiscordAdapter } from "./adapter.js";
 import { processMediaMessage, type MediaAttachment } from "./media-pipeline.js";
-import { registerCommand, parseCommandMessage, executeCommand, listCommands } from "./custom-commands.js";
-import { registerWatch, checkWatches } from "./proactive-suggestions.js";
+import { parseCommandMessage, executeCommand, listCommands } from "./custom-commands.js";
 import {
   describeUnusableSecretRef,
   isUsableSecretRef,
@@ -118,6 +125,46 @@ type DiscordConfig = {
    * different companies have dedicated approvals channels.
    */
   approvalsChannels?: Record<string, string>;
+  /**
+   * One Discord bot per agent. An outbound notification about an issue posts
+   * through the assignee's bot; with no match, it falls back to the
+   * discordBotTokenRef bot. Empty by default, matching upstream's single-bot
+   * behavior exactly.
+   */
+  agentBots?: Array<{
+    agentId: string;
+    botTokenRef: DiscordSecretRef;
+    channelId: string;
+    /** Worker agent IDs whose outbound posts also go through this entry's bot and channel — named explicitly, never looked up via reportsTo at runtime. */
+    alsoForAgentIds?: string[];
+  }>;
+  /**
+   * When set, every inbound path drops any author whose ID does not match this
+   * snowflake. Unset (the default) keeps upstream's unrestricted behavior.
+   */
+  hannaDiscordUserId?: string;
+  /**
+   * Outbound item 4: when a lead's issue reaches `done`, the lead's bot posts
+   * one line here. Empty (the default) posts nothing.
+   */
+  accomplishmentsChannelId?: string;
+  /**
+   * Outbound item 5: when a goal reaches `achieved` or a project reaches
+   * `completed`, the owner's or lead's bot (else the default bot) posts one
+   * line here. Empty (the default) posts nothing.
+   */
+  milestonesChannelId?: string;
+  /** Local Whisper (whisper.cpp) config — see src/voice/stt-whisper.ts for the defaults. */
+  whisperBinaryPath?: string;
+  ffmpegPath?: string;
+  whisperModelPath?: string;
+  whisperLanguage?: string;
+  /**
+   * Standing Paperclip issue a live-voice utterance routes to when there is no
+   * thread Hanna last replied in. Empty (the default) means the plugin creates
+   * one on first need and remembers its id in plugin state.
+   */
+  voiceInboxIssueId?: string;
 };
 
 type IssueNotificationPayload = Record<string, unknown>;
@@ -265,6 +312,27 @@ type DiscordRuntime = {
   retentionDays: number;
   escalationTimeoutMs: number;
   digestMode: string;
+  /**
+   * Resolved agent bot map: one live Gateway client per configured entry,
+   * alongside the plain bot token an outbound REST post authenticates with.
+   * `gateway` is null when that entry's token could not be resolved or its
+   * connection failed — the entry still participates in outbound routing via
+   * its token, only presence/liveness is affected.
+   */
+  agentBots: Array<{
+    agentId: string;
+    /** Effective, deduped worker ids this entry also posts for (see resolveAgentBots). */
+    alsoForAgentIds: string[];
+    token: string;
+    channelId: string;
+    gateway: GatewayHandle | null;
+  }>;
+  /** Normalized snowflake, or null when the operator has not set one (opt-out). */
+  hannaDiscordUserId: string | null;
+  /** Null when unset: no accomplishment posts. */
+  accomplishmentsChannelId: string | null;
+  /** Null when unset: no milestone posts, and no goal or project reads. */
+  milestonesChannelId: string | null;
 };
 
 /** Captured in setup() so onWebhook / onConfigChanged can reach the host APIs. */
@@ -361,6 +429,58 @@ function normalizeDiscordIdList(values: unknown): string[] {
     .filter((value): value is string => value !== null);
 }
 
+/**
+ * The author allowlist. Every inbound path — typed replies, button clicks,
+ * slash commands, voice — calls this before doing anything with what it
+ * received.
+ *
+ * Fails CLOSED: `hannaDiscordUserId` unset drops every author, on every path.
+ * The plan is a single-operator surface; the failure-open shape upstream has
+ * (no ID configured means every author is trusted) is exactly wrong for that —
+ * a missed configuration step must not silently become "everyone is Hanna".
+ * See `applyInboundAllowlistHealth`, which reports this through plugin health
+ * and logs it once per configuration delivery.
+ */
+function isAllowedInboundAuthor(rt: DiscordRuntime, authorId: string | null | undefined): boolean {
+  if (!rt.hannaDiscordUserId) return false;
+  return normalizeDiscordId(authorId) === rt.hannaDiscordUserId;
+}
+
+/** Health issue code: no operator configured, so every inbound author is dropped. */
+const INBOUND_DISABLED_ISSUE = "discord-inbound-disabled";
+
+/**
+ * Surface "no operator configured" through plugin health and the log, once
+ * per configuration delivery. Called right after health is reset to "ok" for
+ * this delivery (see the bootstrap flow), so it never has to fight an
+ * unrelated degradation to report this one — and voice's own health refresh,
+ * called after this, bails out on seeing a non-"ok", non-voice status, so
+ * this note is not overwritten by a voice note in the same delivery.
+ */
+function applyInboundAllowlistHealth(ctx: PluginContext, rt: DiscordRuntime): void {
+  if (rt.hannaDiscordUserId) return;
+  const message =
+    `[${PLUGIN_ID}] inbound is disabled: hannaDiscordUserId is not configured, ` +
+    "so no Discord author is trusted and every reply, button, command, and voice input is dropped";
+  ctx.logger.warn(message, { companyId: rt.companyId });
+  degradeHealth(message, INBOUND_DISABLED_ISSUE, { companyId: rt.companyId });
+}
+
+/** The Discord user ID on an interaction payload (slash command or button click). */
+function interactionAuthorId(interaction: unknown): string | null {
+  const member = (interaction as { member?: { user?: { id?: unknown } } } | null)?.member;
+  return normalizeDiscordId(member?.user?.id);
+}
+
+/** The ephemeral refusal an interaction from a non-operator author gets. */
+function unauthorizedInteractionResponse(): unknown {
+  return respondToInteraction({
+    type: 4,
+    content: "This bot only takes commands from its configured operator.",
+    ephemeral: true,
+  });
+}
+
 async function resolveChannel(
   ctx: PluginContext,
   companyId: string,
@@ -441,7 +561,12 @@ async function enrichIssueNotificationPayload(
       if (payload.projectName == null && issue.project?.name) payload.projectName = issue.project.name;
     }
 
-    if (String(payload.status ?? "") === "done") {
+    const statusForCommentLookup = String(payload.status ?? "");
+    // "done" needs the last comment for the "Completed by" field. `in_review`
+    // and `blocked` need it too — it is the agent's ask that the board-wake
+    // notification (outbound trigger 1) posts to Hanna. Only "done" derives
+    // completedBy from it; the other two statuses just want the text.
+    if (statusForCommentLookup === "done" || statusForCommentLookup === "in_review" || statusForCommentLookup === "blocked") {
       const comments = await ctx.issues.listComments(event.entityId, companyId) as Array<{
         authorAgentId?: string | null;
         authorUserId?: string | null;
@@ -456,7 +581,7 @@ async function enrichIssueNotificationPayload(
           return bTs - aTs;
         })[0];
         if (payload.lastComment == null) payload.lastComment = lastComment.body;
-        if (payload.completedBy == null) {
+        if (statusForCommentLookup === "done" && payload.completedBy == null) {
           if (lastComment.authorUserId) {
             payload.completedBy = lastComment.authorUserId.startsWith("discord:")
               ? lastComment.authorUserId
@@ -466,15 +591,15 @@ async function enrichIssueNotificationPayload(
           }
         }
       }
+    }
 
-      if (payload.completedBy == null) {
-        if (typeof payload.assigneeUserId === "string") {
-          payload.completedBy = payload.assigneeUserId.startsWith("discord:")
-            ? payload.assigneeUserId
-            : "Board user";
-        } else {
-          payload.completedBy = payload.agentName ?? payload.assigneeAgentId ?? null;
-        }
+    if (statusForCommentLookup === "done" && payload.completedBy == null) {
+      if (typeof payload.assigneeUserId === "string") {
+        payload.completedBy = payload.assigneeUserId.startsWith("discord:")
+          ? payload.assigneeUserId
+          : "Board user";
+      } else {
+        payload.completedBy = payload.agentName ?? payload.assigneeAgentId ?? null;
       }
     }
   } catch (error) {
@@ -647,18 +772,6 @@ async function notify(
           eventType: event.eventType,
         },
       );
-      // And the channel-level pointer voice routes by. A spoken utterance is
-      // not a reply, so it has no message to inherit a destination from; this
-      // gives it "whatever this channel is currently about". Last notification
-      // wins — see `voiceTargetKey` for what that means at the read side.
-      await ctx.state.set(
-        { scopeKind: "instance", stateKey: voiceTargetKey(channelId) },
-        {
-          entityId: event.entityId,
-          entityType: event.entityType,
-          companyId: event.companyId,
-        },
-      );
     }
 
     await ctx.activity.log({
@@ -672,6 +785,304 @@ async function notify(
       await onPosted(channelId, messageId);
     }
   }
+}
+
+/** Discord's hard cap for one message is 2,000 characters; the spec sets a
+ * narrower budget of 1,900 for the ask text itself, leaving headroom for the
+ * mention and the issue link on their own lines. */
+const BOARD_WAKE_ASK_LIMIT = 1900;
+
+/** Every status that ever wakes Hanna (spec's Message flow, outbound trigger 1). */
+const BOARD_WAKE_STATUSES = new Set(["in_review", "blocked"]);
+
+/** The pseudo-user an issue is assigned to while it waits on the board. */
+const BOARD_ASSIGNEE = "local-board";
+
+/**
+ * Outbound trigger 1 from the spec's "Message flow": an issue moves to
+ * `in_review` or `blocked`, assigned to `local-board`. The assignee's own bot
+ * (falling back to the default bot — see `resolveOutboundBot`) posts the
+ * agent's ask and mentions the configured operator. This is the only event
+ * that ever posts that mention.
+ *
+ * Opt-in: with no `hannaDiscordUserId` configured there is no one to mention,
+ * so this never fires — matching upstream, which has no such event at all.
+ */
+async function notifyBoardWake(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  event: PluginEvent,
+  payload: IssueNotificationPayload,
+): Promise<void> {
+  if (!rt.hannaDiscordUserId) return;
+  const status = String(payload.status ?? "");
+  if (!BOARD_WAKE_STATUSES.has(status)) return;
+  if (payload.assigneeUserId !== BOARD_ASSIGNEE) return;
+
+  // Dedup on status + the issue's own updatedAt, mirroring the "done"
+  // notification's completedAt marker: a redelivered event with nothing new
+  // to say produces no second message, while a later move back through the
+  // same status (a fresh updatedAt) wakes Hanna again.
+  const marker = `${status}:${String(payload.updatedAt ?? event.occurredAt ?? "")}`;
+  const stateKey = `board_wake_notified_${event.entityId}`;
+  const previousMarker = (await ctx.state.get({ scopeKind: "instance", stateKey })) as string | null;
+  if (previousMarker === marker) return;
+
+  const agentId = typeof payload.assigneeAgentId === "string" ? payload.assigneeAgentId : null;
+  const outboundBot = resolveOutboundBot(rt, agentId);
+  const channelId = await resolveChannel(ctx, event.companyId, outboundBot.channelId ?? rt.defaultChannelId);
+  if (!channelId) {
+    ctx.logger.warn("board-wake: no channel resolved, dropping the wake", {
+      issueId: event.entityId,
+      companyId: event.companyId,
+    });
+    return;
+  }
+
+  const askText = String(payload.lastComment ?? payload.title ?? "").trim();
+  const truncatedAsk =
+    askText.length > BOARD_WAKE_ASK_LIMIT ? askText.slice(0, BOARD_WAKE_ASK_LIMIT) : askText;
+  const identifier = String(payload.identifier ?? event.entityId);
+  const issueUrl = `${rt.baseUrl}/issues/${identifier}`;
+  const mention = `<@${rt.hannaDiscordUserId}>`;
+  const content = [mention, truncatedAsk, issueUrl].filter((line) => line.length > 0).join("\n\n");
+
+  const messageId = await postEmbedWithId(ctx, outboundBot.token, channelId, { content });
+  if (!messageId) {
+    ctx.logger.warn("board-wake: failed to post the wake message to Discord", {
+      issueId: event.entityId,
+      companyId: event.companyId,
+      status,
+    });
+    return;
+  }
+
+  await ctx.state.set({ scopeKind: "instance", stateKey }, marker);
+  if (rt.config.enableInbound !== false) {
+    // So a reply to this exact message routes back to the issue, same as any
+    // other notification (see `notify()` and `resolveInboundDestination`).
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: `msg_${channelId}_${messageId}` },
+      { entityId: event.entityId, entityType: event.entityType, companyId: event.companyId, eventType: event.eventType },
+    );
+  }
+
+  await ctx.activity.log({
+    companyId: event.companyId,
+    message: `Woke Hanna for ${identifier} (${status})`,
+    entityType: "plugin",
+    entityId: event.entityId,
+  });
+}
+
+/**
+ * Posts to the shared channels carry this: Discord resolves no user, role, or
+ * @everyone mention in the content, so a title that happens to contain one
+ * still sends no push. Neither shared channel ever mentions Hanna.
+ */
+const NO_MENTIONS: NonNullable<DiscordMessage["allowed_mentions"]> = { parse: [] };
+
+/** A shared-channel post is one line; a long title is cut to this length. */
+const SHARED_LINE_TEXT_LIMIT = 300;
+
+function oneLine(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > SHARED_LINE_TEXT_LIMIT ? `${flat.slice(0, SHARED_LINE_TEXT_LIMIT - 1)}…` : flat;
+}
+
+/**
+ * Undo a dedup claim after a failed post. If the undo itself fails, the claim
+ * stays set and blocks every later post for this item, so say so loudly.
+ */
+async function releaseClaim(
+  ctx: PluginContext,
+  scope: { scopeKind: "instance"; stateKey: string },
+  restore: string | null,
+): Promise<void> {
+  try {
+    if (restore == null) await ctx.state.delete(scope);
+    else await ctx.state.set(scope, restore);
+  } catch (error) {
+    ctx.logger.error("shared channel post: could not release the dedup claim; this item will not post again until the state key is cleared", {
+      stateKey: scope.stateKey,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
+ * Outbound item 4 from the spec's "Message flow": an issue assigned to a lead
+ * reaches `done`, and the lead's bot posts one line in the accomplishments
+ * channel. A lead is the `agentId` of an `agentBots` entry; an issue assigned
+ * to an `alsoForAgentIds` member posts nothing here (its thread post stays).
+ *
+ * `issue.updated` fires on every issue change, so the plugin must tell a move
+ * into `done` from a later update to a done issue:
+ * - `_previous` names `status`: a change exactly when it was not `done`.
+ * - `_previous` exists without `status`: the status did not change. This also
+ *   covers a PATCH that re-sends `done`, which Paperclip answers with a fresh
+ *   `completedAt` (applyStatusSideEffects) and a `_previous` of that field only.
+ * - No `_previous` (some server paths omit it): the issue's `completedAt`,
+ *   stored per issue, is the marker, as for the thread's done post.
+ * The stored marker also drops a redelivered event in every case.
+ */
+async function notifyAccomplishment(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  event: PluginEvent,
+  payload: IssueNotificationPayload,
+): Promise<void> {
+  const channelId = rt.accomplishmentsChannelId;
+  if (!channelId || !event.entityId) return;
+  if (payload.status !== "done") return;
+  // Enrichment sets assigneeAgentId (null when unassigned); undefined means
+  // the issue read failed, which must not pass as "not a lead's issue".
+  if (payload.assigneeAgentId === undefined) {
+    ctx.logger.warn("accomplishment: could not read the done issue's assignee; posting nothing", {
+      issueId: event.entityId,
+      companyId: event.companyId,
+    });
+    return;
+  }
+  const agentId = typeof payload.assigneeAgentId === "string" ? payload.assigneeAgentId : null;
+  const lead = agentId ? rt.agentBots.find((b) => b.agentId === agentId) : undefined;
+  if (!lead) return;
+
+  const previous = (event.payload as Record<string, unknown> | null)?._previous;
+  if (previous && typeof previous === "object") {
+    if (!("status" in previous)) return;
+    if ((previous as Record<string, unknown>).status === "done") return;
+  }
+
+  const marker = String(payload.completedAt ?? "");
+  if (!marker) {
+    ctx.logger.warn("accomplishment: a done issue has no completedAt, so a repeat cannot be told apart; posting nothing", {
+      issueId: event.entityId,
+      companyId: event.companyId,
+    });
+    return;
+  }
+  const scope = { scopeKind: "instance" as const, stateKey: `accomplishment_posted_${event.entityId}` };
+  const previousMarker = (await ctx.state.get(scope)) as string | null;
+  if (previousMarker === marker) return;
+  // Claim before the post, so a second handler for the same completion skips.
+  await ctx.state.set(scope, marker);
+
+  const identifier = String(payload.identifier ?? event.entityId);
+  const title = oneLine(String(payload.title ?? ""));
+  // Angle brackets keep Discord from unfurling the link into an embed.
+  const content = `✅ ${[identifier, title].filter(Boolean).join(" ")} is done. <${rt.baseUrl}/issues/${identifier}>`;
+
+  const messageId = await postEmbedWithId(ctx, lead.token, channelId, { content, allowed_mentions: NO_MENTIONS });
+  if (!messageId) {
+    ctx.logger.warn("accomplishment: failed to post to Discord", {
+      issueId: event.entityId,
+      companyId: event.companyId,
+      channelId,
+    });
+    // Release the claim, so the next update to this done issue tries again.
+    await releaseClaim(ctx, scope, previousMarker);
+    return;
+  }
+
+  await ctx.activity.log({
+    companyId: event.companyId,
+    message: `Posted accomplishment ${identifier} to Discord`,
+    entityType: "plugin",
+    entityId: event.entityId,
+  });
+}
+
+type MilestoneKind = "goal" | "project";
+
+const MILESTONE_STATUS: Record<MilestoneKind, string> = { goal: "achieved", project: "completed" };
+const MILESTONE_LABEL: Record<MilestoneKind, string> = { goal: "Goal achieved", project: "Project completed" };
+
+/**
+ * Outbound item 5 from the spec's "Message flow": a goal reaches `achieved`,
+ * or a project reaches `completed`. The bot of the goal's `ownerAgentId` or
+ * the project's `leadAgentId` posts one line in the milestones channel,
+ * matched on `agentId` or `alsoForAgentIds`; with no match, the default bot.
+ *
+ * Neither event carries the previous status. `goal.updated` carries the PATCH
+ * body, so `status` is present only when the update set it. `project.updated`
+ * carries only `changedKeys`, with no status at all. So an update that did
+ * not name `status` is skipped with no read. For one that did, the plugin
+ * reads the entity for its current status and owner, and keeps a per-entity
+ * marker in plugin state: it posts when the entity is at its end status and
+ * the marker is not set, and clears the marker when the status moves away,
+ * so a later return posts again.
+ */
+async function notifyMilestone(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  event: PluginEvent,
+  kind: MilestoneKind,
+): Promise<void> {
+  const channelId = rt.milestonesChannelId;
+  const entityId = event.entityId;
+  if (!channelId || !entityId) return;
+
+  const payload = (event.payload ?? {}) as Record<string, unknown>;
+  const touchedStatus =
+    kind === "goal"
+      ? typeof payload.status === "string"
+      : Array.isArray(payload.changedKeys) && payload.changedKeys.includes("status");
+  if (!touchedStatus) return;
+
+  let current: { status: string; name: string; agentId: string | null } | null;
+  try {
+    if (kind === "goal") {
+      const goal = await ctx.goals.get(entityId, event.companyId);
+      current = goal ? { status: goal.status, name: goal.title, agentId: goal.ownerAgentId } : null;
+    } else {
+      const project = await ctx.projects.get(entityId, event.companyId);
+      current = project ? { status: project.status, name: project.name, agentId: project.leadAgentId } : null;
+    }
+  } catch (error) {
+    ctx.logger.warn(`milestone: could not read the ${kind}; posting nothing`, {
+      entityId,
+      companyId: event.companyId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return;
+  }
+  if (!current) {
+    ctx.logger.warn(`milestone: the ${kind} was not found; posting nothing`, { entityId, companyId: event.companyId });
+    return;
+  }
+
+  const endStatus = MILESTONE_STATUS[kind];
+  const scope = { scopeKind: "instance" as const, stateKey: `milestone_posted_${kind}_${entityId}` };
+  const posted = await ctx.state.get(scope);
+  if (current.status !== endStatus) {
+    if (posted != null) await ctx.state.delete(scope);
+    return;
+  }
+  if (posted != null) return;
+  // Claim before the post, so a second handler for the same change skips.
+  await ctx.state.set(scope, endStatus);
+
+  const bot = resolveOutboundBot(rt, current.agentId);
+  const content = `🏁 ${MILESTONE_LABEL[kind]}: ${oneLine(current.name)}`;
+  const messageId = await postEmbedWithId(ctx, bot.token, channelId, { content, allowed_mentions: NO_MENTIONS });
+  if (!messageId) {
+    ctx.logger.warn(`milestone: failed to post the ${kind} to Discord`, {
+      entityId,
+      companyId: event.companyId,
+      channelId,
+    });
+    // Release the claim, so the next status update to this entity tries again.
+    await releaseClaim(ctx, scope, null);
+    return;
+  }
+
+  await ctx.activity.log({
+    companyId: event.companyId,
+    message: `Posted ${kind} milestone to Discord`,
+    entityType: "plugin",
+    entityId,
+  });
 }
 
 function buildEscalationEmbed(payload: EscalationCreatedPayload): {
@@ -764,10 +1175,18 @@ type InboundDestination = {
  */
 type InboundOutcome = "routed" | "empty" | "no-destination" | "rejected" | "stale";
 
-/** State key holding what a text channel is currently about, for voice routing. */
-function voiceTargetKey(channelId: string): string {
-  return `voice_target_${channelId}`;
-}
+/**
+ * Company-scoped state key: the issue of the thread Hanna last replied in
+ * (plan item 9). Written only from a reply — typed or a voice-message
+ * attachment (item 8), both threadKey-prefixed "reply:" — never from a live
+ * #talk utterance itself, so an utterance never becomes its own target.
+ */
+const LAST_REPLIED_THREAD_STATE_KEY = "last_replied_thread";
+
+/** Company-scoped state key caching the standing voice-inbox issue this install created. */
+const VOICE_INBOX_ISSUE_STATE_KEY = "voice_inbox_issue_id";
+
+const VOICE_INBOX_ISSUE_TITLE = "Hanna voice inbox";
 
 /** Trim a configured string to null when it carries nothing. */
 function trimToNull(value: string | undefined | null): string | null {
@@ -791,7 +1210,6 @@ async function resolveInboundDestination(
   ctx: PluginContext,
   rt: DiscordRuntime,
   threadKey: string,
-  input: { channelId: string | null },
 ): Promise<InboundDestination | null> {
   if (threadKey.startsWith("reply:")) {
     const [, channelId, messageId] = threadKey.split(":");
@@ -805,44 +1223,88 @@ async function resolveInboundDestination(
 
   if (threadKey.startsWith("voice:")) {
     // A spoken utterance is not a reply to anything, so it has no message
-    // mapping to inherit. Two destinations, in order.
+    // mapping to inherit. Two destinations, in order (plan item 9):
     //
-    // First: what the transcript's own channel is currently about — the pointer
-    // `notify()` refreshes every time it posts there.
-    //
-    // KNOWN PHASE-1 PROPERTY: that pointer is last-notification-wins. It follows
-    // the most recent thing the plugin announced in the channel, not the thing
-    // the room is talking about, so a notification arriving mid-conversation
-    // moves where the next utterance lands. Phase 1 accepts this; a real
-    // conversation-scoped target needs state voice does not have yet.
-    if (input.channelId) {
-      const pointer = (await ctx.state.get({
-        scopeKind: "instance",
-        stateKey: voiceTargetKey(input.channelId),
-      })) as InboundDestination | null;
-      // Ownership can move between the write and the read (see `claimOwnership`).
-      // A pointer written for a company this install no longer serves must never
-      // route anything: dropping to the configured default is the safe direction,
-      // commenting under the wrong company is not.
-      if (pointer?.entityId && pointer.companyId === rt.companyId) {
-        return pointer;
-      }
-      if (pointer?.entityId) {
-        ctx.logger.info(
-          "voice: ignoring a channel target left by a previous owner of this install",
-          { runningCompanyId: rt.companyId, pointerCompanyId: pointer.companyId },
-        );
-      }
+    // First: the issue of the thread Hanna last replied in — written only by
+    // an actual reply (typed, or a voice-message attachment), scoped to the
+    // company that owns this install, never read across a company boundary.
+    const lastReplied = (await ctx.state.get({
+      scopeKind: "company",
+      scopeId: rt.companyId,
+      stateKey: LAST_REPLIED_THREAD_STATE_KEY,
+    })) as InboundDestination | null;
+    if (lastReplied?.entityId) {
+      return lastReplied;
     }
 
-    // Then: the destination the operator configured, under the company that owns
-    // this install — never a company read from anywhere else (see "Runtime state").
-    const entityId = trimToNull(process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID);
-    if (!entityId) return null;
-    return { entityId, entityType: "issue", companyId: rt.companyId };
+    // Then: the standing voice inbox — configured, or created on first need.
+    const inboxIssueId = await resolveVoiceInboxIssueId(ctx, rt);
+    if (!inboxIssueId) return null;
+    return { entityId: inboxIssueId, entityType: "issue", companyId: rt.companyId };
   }
 
   return null;
+}
+
+/**
+ * The standing "Hanna voice inbox" issue a live-voice utterance falls back to
+ * when there is no thread Hanna last replied in (plan item 9).
+ *
+ * `voiceInboxIssueId` in plugin config wins outright when set. Otherwise the
+ * id is cached in company-scoped plugin state after being created once, so a
+ * install only ever creates one such issue — never re-created just because a
+ * later utterance also finds no reply yet.
+ */
+async function resolveVoiceInboxIssueId(ctx: PluginContext, rt: DiscordRuntime): Promise<string | null> {
+  const configured = trimToNull(rt.config.voiceInboxIssueId);
+  if (configured) return configured;
+
+  const cached = (await ctx.state.get({
+    scopeKind: "company",
+    scopeId: rt.companyId,
+    stateKey: VOICE_INBOX_ISSUE_STATE_KEY,
+  })) as string | null;
+  if (cached) return cached;
+
+  try {
+    const agents = (await ctx.agents.list({ companyId: rt.companyId })) as Array<{ id: string; name: string }>;
+    const emery = agents.find((a) => a.name === "Emery" || a.name.toLowerCase() === "emery");
+    if (!emery) {
+      ctx.logger.warn("voice: could not find Emery to assign the standing voice inbox issue", {
+        companyId: rt.companyId,
+      });
+      return null;
+    }
+
+    const response = await paperclipFetch(
+      `${rt.baseUrl}/api/companies/${rt.companyId}/issues`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: VOICE_INBOX_ISSUE_TITLE,
+          description: "Standing inbox for a live #talk utterance with no thread to route to.",
+          status: "todo",
+          assigneeAgentId: emery.id,
+        }),
+      },
+      rt.paperclipBoardApiKey,
+    );
+    const issue = (await response.json()) as { id?: string };
+    if (!issue.id) return null;
+
+    await ctx.state.set(
+      { scopeKind: "company", scopeId: rt.companyId, stateKey: VOICE_INBOX_ISSUE_STATE_KEY },
+      issue.id,
+    );
+    return issue.id;
+  } catch (err) {
+    ctx.logger.error("voice: failed to create the standing voice inbox issue", {
+      companyId: rt.companyId,
+      error: summarizeError(err, [rt.paperclipBoardApiKey]),
+    });
+    return null;
+  }
 }
 
 /**
@@ -892,9 +1354,10 @@ async function ingestInbound(
   if (!text) return "empty";
   const isLive = input.isLive ?? (() => true);
 
-  const mapping = await resolveInboundDestination(ctx, rt, input.threadKey, input);
+  const mapping = await resolveInboundDestination(ctx, rt, input.threadKey);
   if (!mapping) return "no-destination";
-  // Destination resolution reads the channel pointer, and a retirement can
+  // Destination resolution reads plugin state (and, for voice with no reply
+  // yet, may create the standing inbox issue), and a retirement can
   // interleave with that read.
   if (!isLive()) return "stale";
 
@@ -947,7 +1410,13 @@ async function ingestInbound(
 
   if (mapping.entityType === "issue") {
     if (!isLive()) return "stale";
-    // Route to issue comment
+    // Route to issue comment. No mention prefix: Paperclip's
+    // shouldWakeAssigneeForIssueComment wakes the assignee on any non-self
+    // comment while the issue is open, and a plain "@Name" is not parsed as a
+    // mention there anyway (only "[@Name](agent://<id>)" is) — so the board
+    // comment itself is the whole wake path, and the reply text is posted as
+    // the author wrote it.
+    const commentBody = text;
     try {
       await paperclipFetch(
         `${rt.baseUrl}/api/issues/${mapping.entityId}/comments`,
@@ -955,7 +1424,7 @@ async function ingestInbound(
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            body: text,
+            body: commentBody,
             authorUserId: input.author,
           }),
         },
@@ -967,6 +1436,16 @@ async function ingestInbound(
         from: input.author,
         threadKey: input.threadKey,
       });
+      // A reply — typed, or a voice-message attachment (item 8) — is what
+      // "the thread Hanna last replied in" means for live-voice routing (item
+      // 9). A live #talk utterance never reaches this branch through a
+      // "reply:" threadKey, so it never becomes its own target.
+      if (input.threadKey.startsWith("reply:")) {
+        await ctx.state.set(
+          { scopeKind: "company", scopeId: mapping.companyId, stateKey: LAST_REPLIED_THREAD_STATE_KEY },
+          { entityId: mapping.entityId, entityType: mapping.entityType, companyId: mapping.companyId },
+        );
+      }
       return "routed";
     } catch (err) {
       // A destination that Paperclip rejects — the issue was deleted, it belongs
@@ -984,6 +1463,206 @@ async function ingestInbound(
   return "no-destination";
 }
 
+/** Discord's IS_VOICE_MESSAGE flag (message.flags bit 1<<13). */
+const DISCORD_VOICE_MESSAGE_FLAG = 1 << 13;
+
+/**
+ * Bound on a voice-message attachment download. Discord voice messages are
+ * short by nature; this is generous headroom, not a target.
+ */
+const MAX_VOICE_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+/**
+ * The first attachment on a message that qualifies as spoken audio (plan item
+ * 8): its own content type says audio/*, or the message itself carries
+ * Discord's voice-message flag (some voice-message attachments report a
+ * generic or missing content type). Returns null when nothing qualifies, so
+ * the caller falls through to the ordinary typed-text path.
+ */
+function findQualifyingVoiceAttachment(message: MessageCreateEvent): DiscordMessageAttachment | null {
+  const attachments = message.attachments ?? [];
+  const isVoiceMessage =
+    typeof message.flags === "number" && (message.flags & DISCORD_VOICE_MESSAGE_FLAG) !== 0;
+  for (const attachment of attachments) {
+    const contentType = attachment.content_type?.toLowerCase() ?? "";
+    if (contentType.startsWith("audio/") || isVoiceMessage) {
+      return attachment;
+    }
+  }
+  return null;
+}
+
+/**
+ * Discord's own CDN hosts for message attachments. An attachment URL that
+ * Discord itself did not point at one of these is not trusted — the
+ * attachment record on a message is client-suppliable metadata, not
+ * something Discord signed off on.
+ */
+const ALLOWED_ATTACHMENT_HOSTS = new Set(["cdn.discordapp.com", "media.discordapp.net"]);
+
+/** https, and a host on the allowlist above — nothing else is fetched. */
+function isAllowedAttachmentUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" && ALLOWED_ATTACHMENT_HOSTS.has(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+/** The host of a URL, safe to log even when the URL itself should not be. */
+function safeUrlHost(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "(unparseable URL)";
+  }
+}
+
+/** Ceiling on one attachment download, so a stalled or slow host cannot hang the handler forever. */
+const VOICE_ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 15_000;
+
+/**
+ * Download one Discord attachment: only from Discord's own CDN, over https,
+ * bounded on both the size Discord reports up front and the size actually
+ * received — a lying or stale metadata field must not be trusted on its own,
+ * and that bound is enforced WHILE STREAMING, not after buffering the whole
+ * body, so a response that never stops sending bytes is aborted the moment it
+ * crosses the bound rather than after it has already been held in memory.
+ * Returns null (never throws) on anything that stops the download, so a bad
+ * attachment degrades to "nothing transcribed", not a broken message handler.
+ */
+/** Context every inbound-drop log carries, so a drop is diagnosable without reading the message content. */
+type InboundLogContext = { channelId: string; threadKey: string; author: string };
+
+async function downloadVoiceAttachment(
+  ctx: PluginContext,
+  attachment: DiscordMessageAttachment,
+  logContext: InboundLogContext,
+): Promise<Buffer | null> {
+  if (attachment.size > MAX_VOICE_ATTACHMENT_BYTES) {
+    ctx.logger.warn("voice-message: attachment exceeds the size bound, dropping", {
+      size: attachment.size,
+      maxBytes: MAX_VOICE_ATTACHMENT_BYTES,
+      ...logContext,
+    });
+    return null;
+  }
+  if (!isAllowedAttachmentUrl(attachment.url)) {
+    ctx.logger.warn("voice-message: attachment URL is not an allowed Discord CDN host, dropping", {
+      host: safeUrlHost(attachment.url),
+      ...logContext,
+    });
+    return null;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), VOICE_ATTACHMENT_DOWNLOAD_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    const response = await ctx.http.fetch(attachment.url, { signal: controller.signal });
+    if (!response.ok) {
+      ctx.logger.warn("voice-message: failed to download the audio attachment", {
+        status: response.status,
+        ...logContext,
+      });
+      return null;
+    }
+
+    const reader = (response.body as { getReader?: () => ReadableStreamDefaultReader<Uint8Array> } | null)
+      ?.getReader?.();
+    if (!reader) {
+      // No streaming body from this fetch implementation — the upfront size
+      // check above is still the bound, just not a streaming one.
+      const arrayBuffer = await response.arrayBuffer();
+      if (arrayBuffer.byteLength > MAX_VOICE_ATTACHMENT_BYTES) {
+        ctx.logger.warn("voice-message: downloaded audio exceeded the size bound, dropping", {
+          bytes: arrayBuffer.byteLength,
+          maxBytes: MAX_VOICE_ATTACHMENT_BYTES,
+          ...logContext,
+        });
+        return null;
+      }
+      return Buffer.from(arrayBuffer);
+    }
+
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > MAX_VOICE_ATTACHMENT_BYTES) {
+        await reader.cancel().catch(() => {});
+        ctx.logger.warn("voice-message: downloaded audio exceeded the size bound mid-stream, dropping", {
+          maxBytes: MAX_VOICE_ATTACHMENT_BYTES,
+          ...logContext,
+        });
+        return null;
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks);
+  } catch (err) {
+    if (controller.signal.aborted) {
+      ctx.logger.warn("voice-message: attachment download timed out, dropping", {
+        timeoutMs: VOICE_ATTACHMENT_DOWNLOAD_TIMEOUT_MS,
+        ...logContext,
+      });
+      return null;
+    }
+    ctx.logger.warn("voice-message: attachment download failed", { error: summarizeError(err), ...logContext });
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * A voice message from the allowed author, as a reply in a thread: download,
+ * transcribe locally, then route through the SAME ingress a typed reply uses.
+ * The comment carries the transcript and a link to the audio (spec's "Voice
+ * in"); `ingestInbound` itself is untouched.
+ */
+async function handleVoiceMessageReply(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  message: MessageCreateEvent,
+  attachment: DiscordMessageAttachment,
+  threadKey: string,
+): Promise<void> {
+  const author = `discord:${message.author.username}`;
+  const logContext: InboundLogContext = { channelId: message.channel_id, threadKey, author };
+
+  const audio = await downloadVoiceAttachment(ctx, attachment, logContext);
+  if (!audio) return;
+
+  const sttAdapter = new WhisperSTTAdapter({
+    binaryPath: rt.config.whisperBinaryPath,
+    ffmpegPath: rt.config.ffmpegPath,
+    modelPath: rt.config.whisperModelPath,
+    language: rt.config.whisperLanguage,
+  });
+
+  let transcript: string;
+  try {
+    transcript = await sttAdapter.transcribeBuffer(audio, attachment.filename);
+  } catch (err) {
+    ctx.logger.warn("voice-message: transcription failed", { error: summarizeError(err), ...logContext });
+    return;
+  }
+
+  const outcome = await ingestInbound(ctx, rt, {
+    channelId: message.channel_id,
+    author,
+    authorLabel: message.author.username,
+    text: `${transcript}\n\n${attachment.url}`,
+    threadKey,
+  });
+  await reportInboundOutcome(ctx, rt, outcome, logContext);
+}
+
 /**
  * Reply routing for inbound Discord messages.
  *
@@ -999,19 +1678,67 @@ async function handleMessageCreate(
   if (rt.config.enableInbound === false) return;
   // Ignore bot messages
   if (message.author.bot) return;
+  // The author allowlist: everyone but the configured operator is dropped.
+  // This is a MESSAGE_CREATE with no interaction to respond to, so a log is
+  // the only trace — logged with the author and channel, never the content.
+  if (!isAllowedInboundAuthor(rt, message.author.id)) {
+    ctx.logger.info("handleMessageCreate: dropping a message from an author who is not the configured operator", {
+      authorId: message.author.id,
+      channelId: message.channel_id,
+    });
+    return;
+  }
   // Only handle replies to other messages
   if (!message.message_reference?.message_id) return;
 
   const refChannelId = message.message_reference.channel_id ?? message.channel_id;
   const refMessageId = message.message_reference.message_id;
+  const threadKey = replyThreadKey(refChannelId, refMessageId);
 
-  await ingestInbound(ctx, rt, {
+  // A voice message (plan item 8) takes a different path — local transcription
+  // first — then joins the same ingress a typed reply uses. Anything else, the
+  // ordinary typed-text path, unchanged.
+  const voiceAttachment = findQualifyingVoiceAttachment(message);
+  if (voiceAttachment) {
+    await handleVoiceMessageReply(ctx, rt, message, voiceAttachment, threadKey);
+    return;
+  }
+
+  const author = `discord:${message.author.username}`;
+  const outcome = await ingestInbound(ctx, rt, {
     channelId: message.channel_id,
-    author: `discord:${message.author.username}`,
+    author,
     authorLabel: message.author.username,
     text: message.content ?? "",
-    threadKey: replyThreadKey(refChannelId, refMessageId),
+    threadKey,
   });
+  await reportInboundOutcome(ctx, rt, outcome, { channelId: message.channel_id, threadKey, author });
+}
+
+/**
+ * Log a non-"routed" `ingestInbound` outcome, mirroring
+ * `reportVoiceIngestOutcome`'s "empty"/"stale" exclusion (they say nothing
+ * diagnosable — an empty reply has no missing destination to report, and a
+ * stale one belongs to an owner that no longer exists). For "no-destination"
+ * and "rejected", ALSO tells the author in the same Discord channel: a reply
+ * that never reached Paperclip must not look, from Discord's side, exactly
+ * like one that did.
+ */
+async function reportInboundOutcome(
+  ctx: PluginContext,
+  rt: DiscordRuntime,
+  outcome: InboundOutcome,
+  context: InboundLogContext,
+): Promise<void> {
+  if (outcome === "routed" || outcome === "empty" || outcome === "stale") return;
+
+  ctx.logger.info("inbound reply did not reach an issue", { outcome, ...context });
+
+  const note =
+    outcome === "no-destination"
+      ? "This reply did not reach a Paperclip issue: no destination is configured for this thread."
+      : "This reply did not reach a Paperclip issue: the destination rejected the comment.";
+  await postEmbed(ctx, rt.token, context.channelId, { content: note });
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,6 +1816,16 @@ function retireRuntime(ctx: PluginContext, reason: string): void {
       previous.gateway.close();
     } catch (err) {
       ctx.logger.debug("Closing the retired Discord gateway failed", { error: summarizeError(err) });
+    }
+  }
+  for (const bot of previous.agentBots ?? []) {
+    try {
+      bot.gateway?.close();
+    } catch (err) {
+      ctx.logger.debug("Closing a retired agent bot gateway failed", {
+        agentId: bot.agentId,
+        error: summarizeError(err),
+      });
     }
   }
 }
@@ -1187,6 +1924,166 @@ function claimOwnership(ctx: PluginContext, companyId: string, config: unknown):
  *
  * Never throws: every failure path degrades health and returns null.
  */
+/**
+ * Tear down and rebuild the resolved agent bot map for this runtime.
+ *
+ * Every previous connection is superseded here — a config save that drops or
+ * rotates an entry must not leave an orphaned socket running under a stale
+ * token. An entry with an unresolvable token or a failed connection is
+ * skipped for presence, never fatal: it still participates in outbound
+ * routing via its token once resolved (`resolveOutboundBot` falls back to the
+ * default bot when there is no match at all).
+ */
+async function resolveAgentBots(
+  ctx: PluginContext,
+  companyId: string,
+  entries: NonNullable<DiscordConfig["agentBots"]>,
+  previous: DiscordRuntime["agentBots"],
+): Promise<DiscordRuntime["agentBots"]> {
+  // A shared token (see below) means two resolved entries can point at the
+  // SAME gateway object; close each live connection at most once.
+  const alreadyClosed = new Set<GatewayHandle>();
+  for (const prev of previous) {
+    if (!prev.gateway || alreadyClosed.has(prev.gateway)) continue;
+    alreadyClosed.add(prev.gateway);
+    try {
+      prev.gateway.close();
+    } catch (err) {
+      ctx.logger.debug("Closing a superseded agent bot gateway failed", {
+        agentId: prev.agentId,
+        error: summarizeError(err),
+      });
+    }
+  }
+
+  /** Label an entry for a log line by its own configured agent id, or its position when that itself is unusable. */
+  const entryLabel = (entry: { agentId?: unknown }, index: number): string =>
+    normalizeDiscordId(entry?.agentId) ?? `entry #${index}`;
+
+  // Claim every agent id an entry names — its own agentId, then
+  // alsoForAgentIds, in that order — against the FIRST entry to claim it.
+  // Checked across ALL entries and within one entry's own list alike (a
+  // repeated or self-referential id is exactly as much a config error as two
+  // leads both naming the same worker). A later claim never moves the work
+  // to a second bot: it is dropped, and logged.
+  const claimedBy = new Map<string, number>();
+  const effectiveIds: string[][] = entries.map(() => []);
+  entries.forEach((entry, index) => {
+    const alsoFor = Array.isArray(entry?.alsoForAgentIds) ? entry.alsoForAgentIds : [];
+    const claims = [entry?.agentId, ...alsoFor]
+      .map((id) => normalizeDiscordId(id))
+      .filter((id): id is string => id !== null);
+    for (const id of claims) {
+      const existingIndex = claimedBy.get(id);
+      if (existingIndex === undefined) {
+        claimedBy.set(id, index);
+        effectiveIds[index]!.push(id);
+        continue;
+      }
+      ctx.logger.warn("agentBots: agent id claimed by more than one entry; the first entry wins", {
+        agentId: id,
+        firstEntry: entryLabel(entries[existingIndex]!, existingIndex),
+        droppedEntry: entryLabel(entry, index),
+      });
+    }
+  });
+
+  const resolved: DiscordRuntime["agentBots"] = [];
+  // One Gateway connection per resolved TOKEN, however many entries share it
+  // (a copy-pasted botTokenRef, or two secrets holding the same value).
+  const gatewayByToken = new Map<string, GatewayHandle | null>();
+  const firstAgentIdForToken = new Map<string, string>();
+
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index]!;
+    const agentId = normalizeDiscordId(entry?.agentId);
+    const channelId = normalizeDiscordId(entry?.channelId);
+    const binding = toSecretRefBinding(entry?.botTokenRef);
+    if (!agentId || !channelId || !binding) {
+      ctx.logger.warn(
+        "Skipping an agentBots entry with a missing agentId, channelId, or a usable botTokenRef",
+        { agentId },
+      );
+      continue;
+    }
+
+    let token: string;
+    try {
+      token = await ctx.secrets.resolve(binding, { companyId, configPath: "agentBots.botTokenRef" });
+    } catch (err) {
+      ctx.logger.warn(
+        "Could not resolve an agent bot token; that agent's outbound posts fall back to the default bot",
+        { agentId, error: summarizeError(err, [entry?.botTokenRef, binding.secretId]) },
+      );
+      continue;
+    }
+
+    let gateway: GatewayHandle | null;
+    if (gatewayByToken.has(token)) {
+      gateway = gatewayByToken.get(token) ?? null;
+      ctx.logger.warn("agentBots: two entries resolve to the same bot token; reusing one Gateway connection", {
+        agentId,
+        sharedWithAgentId: firstAgentIdForToken.get(token),
+      });
+    } else {
+      gateway = null;
+      try {
+        // listenForMessages is false: Hanna's replies reach Paperclip over the
+        // single default-bot gateway already listening in this guild (see
+        // "Server layout" — every bot sits in the one private server), so a
+        // second listener here would only duplicate MESSAGE_CREATE handling.
+        // This connection exists so the agent's bot user shows online and so a
+        // REST post through its token has a live session behind it.
+        gateway = await connectGateway(
+          ctx,
+          token,
+          async () =>
+            respondToInteraction({
+              type: 4,
+              content: "This bot does not handle commands here.",
+              ephemeral: true,
+            }),
+          undefined,
+          { listenForMessages: false },
+        );
+      } catch (err) {
+        ctx.logger.warn("Agent bot gateway connection failed; outbound posts still use its token", {
+          agentId,
+          error: summarizeError(err, [token]),
+        });
+      }
+      gatewayByToken.set(token, gateway);
+      firstAgentIdForToken.set(token, agentId);
+    }
+
+    // Effective alsoForAgentIds: everything this entry won its claim on,
+    // minus its own leadAgentId (kept separately as `agentId` on the record).
+    const alsoForAgentIds = effectiveIds[index]!.filter((id) => id !== agentId);
+    resolved.push({ agentId, alsoForAgentIds, token, channelId, gateway });
+  }
+
+  return resolved;
+}
+
+/**
+ * Which bot an outbound post about an agent's work should go through: that
+ * agent's own bot when the agent bot map has one, else the default
+ * `discordBotTokenRef` bot. With `agentBots` empty (upstream's default) this
+ * always returns the default bot — unchanged from before the map existed.
+ */
+function resolveOutboundBot(
+  rt: DiscordRuntime,
+  agentId: string | null | undefined,
+): { token: string; channelId: string | null } {
+  if (agentId) {
+    // A lead's own id, or a worker id explicitly listed under it
+    // (alsoForAgentIds) — both post through the lead's bot and channel.
+    const match = rt.agentBots.find((b) => b.agentId === agentId || b.alsoForAgentIds.includes(agentId));
+    if (match) return { token: match.token, channelId: match.channelId };
+  }
+  return { token: rt.token, channelId: null };
+}
+
 async function bootstrapRuntime(
   ctx: PluginContext,
   companyId: string,
@@ -1309,6 +2206,15 @@ async function bootstrapRuntime(
   rt.listenForMessages = listenForMessages;
   rt.voiceEnabled = voiceEnabled;
   rt.voice = rt.voice ?? null;
+  rt.hannaDiscordUserId = normalizeDiscordId(config.hannaDiscordUserId);
+  rt.accomplishmentsChannelId = normalizeDiscordId(config.accomplishmentsChannelId);
+  rt.milestonesChannelId = normalizeDiscordId(config.milestonesChannelId);
+  if (rt.accomplishmentsChannelId && (config.agentBots ?? []).length === 0) {
+    ctx.logger.warn(
+      "accomplishmentsChannelId is set but agentBots is empty: only a lead in agentBots posts accomplishments, so none will post",
+      { companyId },
+    );
+  }
 
   if (!reuseGateway) {
     // Voice rides this socket's adapter; it cannot outlive the connection it
@@ -1360,6 +2266,9 @@ async function bootstrapRuntime(
               ephemeral: true,
             });
           }
+          if (!isAllowedInboundAuthor(current, interactionAuthorId(interaction))) {
+            return unauthorizedInteractionResponse();
+          }
           return handleInteraction(ctx, interaction as any, current.cmdCtx);
         },
         listenForMessages
@@ -1398,9 +2307,16 @@ async function bootstrapRuntime(
     }
   }
 
+  // Connected after the default bot, so gatewayConnects (and any log ordering
+  // depending on it) always shows the default bot first.
+  rt.agentBots = await resolveAgentBots(ctx, companyId, config.agentBots ?? [], existing?.agentBots ?? []);
+
   if (runtimeHealth.status !== "ok") {
     setRuntimeHealth({ status: "ok" });
   }
+  // Reapplied every delivery, same as voice's own note below: a configuration
+  // save is not evidence that an operator is now configured.
+  applyInboundAllowlistHealth(ctx, rt);
 
   await startVoiceIfConfigured(ctx, rt, voiceEnv);
   // The reset above cleared health wholesale. Voice's own notes are not the
@@ -1594,7 +2510,8 @@ async function startVoiceIfConfigured(
   if (!voiceEnv) {
     ctx.logger.info(
       "voice: disabled — set DISCORD_VOICE_GUILD_ID, DISCORD_VOICE_CHANNEL_ID, " +
-        "DISCORD_VOICE_WEBHOOK_URL and DEEPGRAM_API_KEY to enable it",
+        "and DISCORD_VOICE_WEBHOOK_URL to enable it. Speech-to-text is local " +
+        "Whisper, configured from the plugin's own settings, not the environment.",
     );
     return;
   }
@@ -1639,7 +2556,7 @@ async function startVoiceIfConfigured(
   const stillOurs = (): boolean => session.active && runtime === rt;
 
   try {
-    const { VoiceClient, createPluginDiscordAdapter } = await import("./voice/index.js");
+    const { VoiceClient, createPluginDiscordAdapter, WhisperSTTAdapter } = await import("./voice/index.js");
 
     // Loading the voice module is an await like any other, and a permanent
     // gateway failure or plugin shutdown can tear this session down while it is
@@ -1653,20 +2570,40 @@ async function startVoiceIfConfigured(
       return;
     }
 
-    const voiceClient = new VoiceClient(ctx, {
+    const sttAdapter = new WhisperSTTAdapter({
+      binaryPath: rt.config.whisperBinaryPath,
+      ffmpegPath: rt.config.ffmpegPath,
+      modelPath: rt.config.whisperModelPath,
+      language: rt.config.whisperLanguage,
+    });
+
+    const voiceClient = new VoiceClient(
+      ctx,
+      {
       guildId: voiceEnv.guildId,
       voiceChannelId: voiceEnv.voiceChannelId,
       textChannelWebhookUrl: voiceEnv.webhookUrl,
-      deepgramApiKey: voiceEnv.deepgramApiKey,
       relayUsername: voiceEnv.relayUsername,
       voiceAdapterCreator: createPluginDiscordAdapter(gatewayVoice),
       // Joining is driven by the gateway's own READY/RESUMED boundary, never by
       // this call returning: an op-4 sent before the socket has identified is
       // not deliverable, and @discordjs/voice does not retry one it could not send.
       onGatewayReady: (handler) => gatewayVoice.onGatewayReady(handler),
+      // The FIRST allowlist check, in VoiceClient itself, before it even
+      // subscribes to a speaker's audio — so a non-operator speaker is never
+      // decoded, transcribed, or relayed (security review A2).
+      isAllowedSpeaker: (userId) => isAllowedInboundAuthor(rt, userId),
       // Voice reaches Paperclip HERE, through the same ingress as a typed reply.
       // The webhook transcript is display only.
       ingestUtterance: async (utterance) => {
+        // Checked again here: `rt` can be reconfigured between VoiceClient
+        // construction and this call landing, and this is what actually
+        // decides whether Paperclip gets written to.
+        if (!isAllowedInboundAuthor(rt, utterance.userId)) {
+          ctx.logger.info("voice: dropping an utterance from an author who is not the configured operator");
+          return;
+        }
+
         // The channel voice routes by is the one the transcript appears in, not
         // the voice channel it was spoken in: that is where notifications land,
         // and so it is the only one that has a target to inherit.
@@ -1709,7 +2646,9 @@ async function startVoiceIfConfigured(
             (reason ?? "reason not reported");
         refreshVoiceHealth(rt);
       },
-    });
+      },
+      sttAdapter,
+    );
     // Retained BEFORE start() is awaited: a client that fails after construction
     // still has a connection and gateway subscriptions that must be released.
     session.stopClient = () => voiceClient.stop();
@@ -1748,19 +2687,16 @@ function readVoiceEnv(): {
   guildId: string;
   voiceChannelId: string;
   webhookUrl: string;
-  deepgramApiKey: string;
   relayUsername: string | undefined;
 } | null {
   const guildId = process.env.DISCORD_VOICE_GUILD_ID;
   const voiceChannelId = process.env.DISCORD_VOICE_CHANNEL_ID;
   const webhookUrl = process.env.DISCORD_VOICE_WEBHOOK_URL;
-  const deepgramApiKey = process.env.DEEPGRAM_API_KEY;
-  if (!guildId || !voiceChannelId || !webhookUrl || !deepgramApiKey) return null;
+  if (!guildId || !voiceChannelId || !webhookUrl) return null;
   return {
     guildId,
     voiceChannelId,
     webhookUrl,
-    deepgramApiKey,
     relayUsername: process.env.DISCORD_VOICE_USERNAME,
   };
 }
@@ -1945,6 +2881,9 @@ const plugin = definePlugin({
     ctx.events.on("plugin.stopping", async () => {
       if (runtime) stopVoice(ctx, runtime, "plugin stopping", "discard");
       runtime?.gateway?.close();
+      for (const bot of runtime?.agentBots ?? []) {
+        bot.gateway?.close();
+      }
     });
 
     // --- ACP bridge: listen for cross-plugin ACP output events ---
@@ -1994,6 +2933,41 @@ const plugin = definePlugin({
       }
 
       await notify(ctx, rt, { ...event, payload }, formatIssueDone);
+    });
+
+    // Outbound trigger 1 (spec's "Message flow"): an issue moved to
+    // `in_review` or `blocked`, assigned to `local-board`, wakes Hanna. Opt-in
+    // via `rt.hannaDiscordUserId` — see `notifyBoardWake`.
+    ctx.events.on("issue.updated", async (event: PluginEvent) => {
+      const rt = await ensureRuntime(ctx, event.companyId);
+      if (!rt) return;
+      const payload = await enrichIssueNotificationPayload(ctx, event);
+      await notifyBoardWake(ctx, rt, event, payload);
+    });
+
+    // Outbound item 4: a lead's issue reaching `done` posts one line in the
+    // accomplishments channel. Opt-in via accomplishmentsChannelId, and only a
+    // lead in agentBots qualifies — see `notifyAccomplishment`.
+    ctx.events.on("issue.updated", async (event: PluginEvent) => {
+      const rt = await ensureRuntime(ctx, event.companyId);
+      if (!rt || !rt.accomplishmentsChannelId || rt.agentBots.length === 0) return;
+      const payload = await enrichIssueNotificationPayload(ctx, event);
+      await notifyAccomplishment(ctx, rt, event, payload);
+    });
+
+    // Outbound item 5: a goal reaching `achieved` or a project reaching
+    // `completed` posts one line in the milestones channel. Opt-in via
+    // milestonesChannelId — see `notifyMilestone`.
+    ctx.events.on("goal.updated", async (event: PluginEvent) => {
+      const rt = await ensureRuntime(ctx, event.companyId);
+      if (!rt) return;
+      await notifyMilestone(ctx, rt, event, "goal");
+    });
+
+    ctx.events.on("project.updated", async (event: PluginEvent) => {
+      const rt = await ensureRuntime(ctx, event.companyId);
+      if (!rt) return;
+      await notifyMilestone(ctx, rt, event, "project");
     });
 
     ctx.events.on("approval.created", async (event: PluginEvent) => {
@@ -2230,93 +3204,14 @@ const plugin = definePlugin({
       },
     );
 
-    // ===================================================================
-    // Phase 2: Multi-Agent tools (3-arg register with ToolRunContext)
-    // ===================================================================
-
-    ctx.tools.register(
-      "handoff_to_agent",
-      {
-        displayName: "Handoff to Agent",
-        description: "Hand off a conversation to another agent. Requires human approval.",
-        parametersSchema: {
-          type: "object",
-          properties: {
-            threadId: { type: "string", description: "Discord thread ID" },
-            fromAgent: { type: "string", description: "Agent initiating the handoff" },
-            toAgent: { type: "string", description: "Target agent name" },
-            reason: { type: "string", description: "Reason for the handoff" },
-            context: { type: "string", description: "Context to pass to target agent" },
-          },
-          required: ["threadId", "fromAgent", "toAgent", "reason"],
-        },
-      },
-      async (params, runCtx) => {
-        const rt = await ensureRuntime(ctx, runCtx.companyId);
-        if (!rt) return { error: RUNTIME_NOT_READY_MESSAGE };
-        const p = params as Record<string, unknown>;
-        const result = await initiateHandoff(
-          ctx,
-          rt.token,
-          String(p.threadId),
-          String(p.fromAgent),
-          String(p.toAgent),
-          runCtx.companyId,
-          String(p.reason),
-          p.context ? String(p.context) : undefined,
-        );
-        return {
-          content: JSON.stringify({
-            handoffId: result.handoffId,
-            status: result.status,
-            message: "Handoff posted to Discord for human approval.",
-          }),
-        };
-      },
-    );
-
-    ctx.tools.register(
-      "discuss_with_agent",
-      {
-        displayName: "Discuss with Agent",
-        description: "Start a multi-turn discussion between two agents with human checkpoints.",
-        parametersSchema: {
-          type: "object",
-          properties: {
-            threadId: { type: "string", description: "Discord thread ID" },
-            initiator: { type: "string", description: "Agent starting the discussion" },
-            target: { type: "string", description: "Agent to discuss with" },
-            topic: { type: "string", description: "Topic or question" },
-            maxTurns: { type: "number", description: "Max turns (default 10, max 50)" },
-            humanCheckpointInterval: { type: "number", description: "Pause every N turns (0 = none)" },
-          },
-          required: ["threadId", "initiator", "target", "topic"],
-        },
-      },
-      async (params, runCtx) => {
-        const rt = await ensureRuntime(ctx, runCtx.companyId);
-        if (!rt) return { error: RUNTIME_NOT_READY_MESSAGE };
-        const p = params as Record<string, unknown>;
-        const result = await startDiscussion(
-          ctx,
-          rt.token,
-          String(p.threadId),
-          String(p.initiator),
-          String(p.target),
-          runCtx.companyId,
-          String(p.topic),
-          p.maxTurns ? Number(p.maxTurns) : 10,
-          p.humanCheckpointInterval ? Number(p.humanCheckpointInterval) : 0,
-        );
-        return {
-          content: JSON.stringify({
-            discussionId: result.discussionId,
-            status: result.status,
-            message: "Discussion loop started.",
-          }),
-        };
-      },
-    );
+    // Phase 2's multi-agent tools (handoff_to_agent, discuss_with_agent) are
+    // removed: the v1 runaway came from agents waking agents (see "What stays
+    // off" in the spec), so no tool lets an agent hand off to, or discuss
+    // with, another agent. Security review A5 went further: the handoff_/
+    // disc_ button-click path in commands.ts no longer dispatches to
+    // session-registry's handleHandoffButton/handleDiscussionButton at all —
+    // both are refused with an ephemeral reply, so a stale or replayed
+    // custom_id cannot complete one either.
 
     // ===================================================================
     // Phase 1: Escalation timeout check job
@@ -2446,103 +3341,18 @@ const plugin = definePlugin({
       }
     });
 
-    // ===================================================================
-    // Phase 4: Custom Commands tool (3-arg register)
-    // ===================================================================
-
-    ctx.tools.register(
-      "register_custom_command",
-      {
-        displayName: "Register Custom Command",
-        description: "Register a custom !command for Discord users to invoke.",
-        parametersSchema: {
-          type: "object",
-          properties: {
-            companyId: { type: "string", description: "Ignored: the host-authenticated company of the invocation is always used" },
-            command: { type: "string", description: "Command name (without !)" },
-            description: { type: "string", description: "Description" },
-            parameters: {
-              type: "array",
-              items: { type: "object", properties: { name: { type: "string" }, description: { type: "string" }, required: { type: "boolean" } } },
-              description: "Parameters",
-            },
-          },
-          required: ["companyId", "command", "description"],
-        },
-      },
-      async (params, runCtx) => {
-        const rt = await ensureRuntime(ctx, runCtx.companyId);
-        if (!rt) return { error: RUNTIME_NOT_READY_MESSAGE };
-        if (rt.config.enableCustomCommands === false) {
-          return { error: "Custom commands are disabled in this plugin configuration." };
-        }
-        const p = params as Record<string, unknown>;
-        const result = await registerCommand(
-          ctx,
-          runCtx.companyId,
-          String(p.command),
-          String(p.description),
-          (p.parameters as Array<{ name: string; description: string; required: boolean }>) ?? [],
-          runCtx.agentId,
-          String(p.agentName ?? runCtx.agentId),
-        );
-        return { content: JSON.stringify(result) };
-      },
-    );
-
-    // ===================================================================
-    // Phase 5: Proactive Suggestions tool (3-arg register)
-    // ===================================================================
-
-    ctx.tools.register(
-      "register_watch",
-      {
-        displayName: "Register Watch",
-        description: "Register a watch condition that fires proactive suggestions.",
-        parametersSchema: {
-          type: "object",
-          properties: {
-            companyId: { type: "string", description: "Ignored: the host-authenticated company of the invocation is always used" },
-            watchName: { type: "string", description: "Watch name" },
-            patterns: { type: "array", items: { type: "string" }, description: "Regex patterns" },
-            channelIds: { type: "array", items: { type: "string" }, description: "Channel IDs (empty = all)" },
-            responseTemplate: { type: "string", description: "Suggestion template" },
-            cooldownMinutes: { type: "number", description: "Cooldown minutes (default 60)" },
-          },
-          required: ["companyId", "watchName", "patterns", "responseTemplate"],
-        },
-      },
-      async (params, runCtx) => {
-        const rt = await ensureRuntime(ctx, runCtx.companyId);
-        if (!rt) return { error: RUNTIME_NOT_READY_MESSAGE };
-        if (rt.config.enableProactiveSuggestions === false) {
-          return { error: "Proactive suggestions are disabled in this plugin configuration." };
-        }
-        const p = params as Record<string, unknown>;
-        const result = await registerWatch(
-          ctx,
-          runCtx.companyId,
-          String(p.watchName),
-          (p.patterns as string[]) ?? [],
-          (p.channelIds as string[]) ?? [],
-          String(p.responseTemplate),
-          p.cooldownMinutes ? Number(p.cooldownMinutes) : 60,
-          runCtx.agentId,
-          String(p.agentName ?? runCtx.agentId),
-        );
-        return { content: JSON.stringify(result) };
-      },
-    );
-
+    // register_custom_command and register_watch tools are removed (plan item
+    // 6): no tool lets an agent register a command or a watch. Security
+    // review A5 went further for watches specifically: this job used to still
+    // evaluate whatever watch a PREVIOUS install had registered, and a match
+    // invoked an agent with no human step in between — a residual
+    // agent-to-agent surface even with no tool left to register a new one.
+    // It is now fully inert, unconditionally, regardless of config. The
+    // manifest still lists the job (the host expects a handler for every job
+    // it declares), and custom-commands.ts / proactive-suggestions.ts stay as
+    // dead code paths rather than being torn out wholesale in this pass.
     ctx.jobs.register("check-watches", async () => {
-      const rt = await ensureRuntime(ctx);
-      if (!rt) return;
-      const cid = rt.companyId;
-      if (rt.config.enableProactiveSuggestions === false) {
-        ctx.logger.debug("check-watches: proactive suggestions disabled, skipping");
-        return;
-      }
-      await checkWatches(ctx, rt.token, cid, rt.defaultChannelId);
+      ctx.logger.debug("check-watches: retired — proactive suggestions are removed from this fork");
     });
 
     // ===================================================================
@@ -2835,7 +3645,8 @@ const plugin = definePlugin({
       const ctx = _pluginCtx;
       // An interaction carries no company scope, so this consumes whatever
       // runtime a configuration delivery has already established, if any.
-      const cmdCtx = (await ensureRuntime(ctx))?.cmdCtx ?? null;
+      const rt = await ensureRuntime(ctx);
+      const cmdCtx = rt?.cmdCtx ?? null;
 
       if (!ctx || !cmdCtx) {
         // Return a valid Discord interaction response even before setup completes.
@@ -2845,6 +3656,10 @@ const plugin = definePlugin({
           content: "Plugin is still starting up. Please try again in a moment.",
           ephemeral: true,
         }) as unknown as void;
+      }
+
+      if (!isAllowedInboundAuthor(rt!, interactionAuthorId(body))) {
+        return unauthorizedInteractionResponse() as unknown as void;
       }
 
       try {

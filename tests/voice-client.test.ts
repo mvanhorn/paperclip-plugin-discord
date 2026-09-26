@@ -154,7 +154,6 @@ function buildClient(
       guildId: "guild-1",
       voiceChannelId: "chan-1",
       textChannelWebhookUrl: "https://discord.test/api/webhooks/1/secret-token",
-      deepgramApiKey: "dg-key",
       voiceAdapterCreator: () => ({
         sendPayload: () => true,
         destroy: adapterDestroy,
@@ -312,15 +311,18 @@ describe("VoiceClient — a failed start leaks nothing and shows in health (F5)"
   });
 });
 
-describe("VoiceClient — a receive-stream failure cannot kill the worker (F3)", () => {
-  async function joinedClient(options: { realRelay?: boolean } = {}) {
-    const built = buildClient({}, options);
-    await built.client.start();
-    built.hook.fire();
-    await vi.waitFor(() => expect(voiceState.connections).toHaveLength(1));
-    return { ...built, connection: voiceState.connections[0] };
-  }
+async function joinedClient(
+  options: { realRelay?: boolean } = {},
+  overrides: Record<string, unknown> = {},
+) {
+  const built = buildClient(overrides, options);
+  await built.client.start();
+  built.hook.fire();
+  await vi.waitFor(() => expect(voiceState.connections).toHaveLength(1));
+  return { ...built, connection: voiceState.connections[0] };
+}
 
+describe("VoiceClient — a receive-stream failure cannot kill the worker (F3)", () => {
   it("survives an error destroying the receive stream, and transcribes nothing", async () => {
     const { client, connection, stt, relay, ingestUtterance, ctx } = await joinedClient();
 
@@ -529,6 +531,105 @@ describe("VoiceClient — a receive-stream failure cannot kill the worker (F3)",
     connection.receiver.streams[0].end(HALF_SECOND_PCM);
 
     await vi.waitFor(() => expect(ingestUtterance).toHaveBeenCalledTimes(1));
+    client.stop();
+  });
+});
+
+describe("VoiceClient — speaker allowlist is checked before subscribing (security review A2)", () => {
+  it("never subscribes, decodes, transcribes, or relays a speaker isAllowedSpeaker rejects", async () => {
+    const { client, connection, stt, relay, ingestUtterance, ctx } = await joinedClient(
+      {},
+      { isAllowedSpeaker: (userId: string) => userId === "hanna" },
+    );
+
+    connection.receiver.speaking.emit("start", "eve");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(connection.receiver.streams).toHaveLength(0);
+    expect(stt.transcribeUtterance).not.toHaveBeenCalled();
+    expect(relay.postTranscript).not.toHaveBeenCalled();
+    expect(ingestUtterance).not.toHaveBeenCalled();
+    expect(ctx.logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("configured operator"),
+      expect.objectContaining({ userId: "eve" }),
+    );
+    client.stop();
+  });
+
+  it("still processes a speaker isAllowedSpeaker accepts", async () => {
+    const { client, connection, stt, relay, ingestUtterance } = await joinedClient(
+      {},
+      { isAllowedSpeaker: (userId: string) => userId === "hanna" },
+    );
+
+    connection.receiver.speaking.emit("start", "hanna");
+    await vi.waitFor(() => expect(connection.receiver.streams).toHaveLength(1));
+    connection.receiver.streams[0].end(HALF_SECOND_PCM);
+
+    await vi.waitFor(() => expect(relay.postTranscript).toHaveBeenCalled());
+    expect(stt.transcribeUtterance).toHaveBeenCalledTimes(1);
+    expect(ingestUtterance).toHaveBeenCalledWith(expect.objectContaining({ userId: "hanna" }));
+    client.stop();
+  });
+
+  it("processes every speaker when isAllowedSpeaker is not configured (unchanged default)", async () => {
+    const { client, connection, stt } = await joinedClient();
+
+    connection.receiver.speaking.emit("start", "anyone");
+    await vi.waitFor(() => expect(connection.receiver.streams).toHaveLength(1));
+    connection.receiver.streams[0].end(HALF_SECOND_PCM);
+
+    await vi.waitFor(() => expect(stt.transcribeUtterance).toHaveBeenCalledTimes(1));
+    client.stop();
+  });
+});
+
+describe("VoiceClient — at most one transcription in flight (security review A2)", () => {
+  it("drops a second utterance while the first is still transcribing, without a second STT call", async () => {
+    const { client, connection, stt, ctx } = await joinedClient();
+
+    let releaseFirst: (value: string) => void = () => {};
+    stt.transcribeUtterance.mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        releaseFirst = resolve;
+      }),
+    );
+
+    connection.receiver.speaking.emit("start", "user-1");
+    await vi.waitFor(() => expect(connection.receiver.streams).toHaveLength(1));
+    connection.receiver.streams[0].end(HALF_SECOND_PCM);
+    await vi.waitFor(() => expect(stt.transcribeUtterance).toHaveBeenCalledTimes(1));
+
+    // A second speaker, while the first is still being transcribed.
+    connection.receiver.speaking.emit("start", "user-2");
+    await vi.waitFor(() => expect(connection.receiver.streams).toHaveLength(2));
+    connection.receiver.streams[1].end(HALF_SECOND_PCM);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(stt.transcribeUtterance).toHaveBeenCalledTimes(1);
+    expect(ctx.logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("already in flight"),
+      expect.objectContaining({ userId: "user-2" }),
+    );
+
+    releaseFirst("hello there");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    client.stop();
+  });
+
+  it("accepts a new utterance once the previous transcription has finished", async () => {
+    const { client, connection, stt } = await joinedClient();
+
+    connection.receiver.speaking.emit("start", "user-1");
+    await vi.waitFor(() => expect(connection.receiver.streams).toHaveLength(1));
+    connection.receiver.streams[0].end(HALF_SECOND_PCM);
+    await vi.waitFor(() => expect(stt.transcribeUtterance).toHaveBeenCalledTimes(1));
+
+    connection.receiver.speaking.emit("start", "user-2");
+    await vi.waitFor(() => expect(connection.receiver.streams).toHaveLength(2));
+    connection.receiver.streams[1].end(HALF_SECOND_PCM);
+
+    await vi.waitFor(() => expect(stt.transcribeUtterance).toHaveBeenCalledTimes(2));
     client.stop();
   });
 });

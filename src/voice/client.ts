@@ -4,8 +4,9 @@
  * Joins a Discord voice channel via @discordjs/voice using the custom gateway
  * adapter from ./discord-adapter.ts. For each speaker, listens for an Opus
  * stream that ends after 800 ms of silence (the silence detection IS the VAD —
- * no separate VAD library), decodes to PCM via prism-media, transcribes via
- * Deepgram, hands the utterance to the plugin's inbound ingress, and posts the
+ * no separate VAD library), decodes to PCM via prism-media, transcribes via a
+ * local Whisper adapter (see ./stt-whisper.ts — no audio leaves the machine),
+ * hands the utterance to the plugin's inbound ingress, and posts the
  * transcript into a text channel by webhook so the room can see what was heard.
  *
  * The webhook post is DISPLAY ONLY. Nothing re-reads it: the utterance reaches
@@ -27,7 +28,7 @@ import {
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import prism from "prism-media";
 
-import { DeepgramSTTAdapter } from "./stt-deepgram.js";
+import { WhisperSTTAdapter } from "./stt-whisper.js";
 import { WebhookTextChannelRelay } from "./text-channel-relay.js";
 import type {
   STTAdapter,
@@ -94,6 +95,15 @@ export class VoiceClient {
   /** Identifies one join of one channel; part of each utterance's thread key. */
   private sessionId: string | null = null;
   private available = false;
+  /**
+   * At most one Whisper transcription in flight at a time. Several speakers
+   * finishing near-simultaneously would otherwise spawn one whisper-cli
+   * process per speaker, and this model is not cheap. A second utterance
+   * that lands while one is already transcribing is dropped, not queued —
+   * simpler, and a backlog of stale utterances is not obviously better than
+   * losing the newest one.
+   */
+  private transcribing = false;
 
   private readonly ctx: PluginContext;
   private readonly config: VoiceClientConfig;
@@ -109,7 +119,7 @@ export class VoiceClient {
   ) {
     this.ctx = ctx;
     this.config = config;
-    this.stt = stt ?? new DeepgramSTTAdapter({ apiKey: config.deepgramApiKey });
+    this.stt = stt ?? new WhisperSTTAdapter();
     this.relay =
       relay ??
       new WebhookTextChannelRelay({
@@ -229,6 +239,14 @@ export class VoiceClient {
       }
 
       connection.receiver.speaking.on("start", (userId) => {
+        // Checked before ANY work happens for this speaker: no subscribe, no
+        // decode, no STT, no relay post. A rejected speaker leaves no trace.
+        if (this.config.isAllowedSpeaker && !this.config.isAllowedSpeaker(userId)) {
+          this.ctx.logger.info("voice: dropping a speaker who is not the configured operator", {
+            userId,
+          });
+          return;
+        }
         this.handleUtterance(userId, connection).catch((err) => {
           this.ctx.logger.error("voice: utterance handling failed", {
             userId,
@@ -338,7 +356,15 @@ export class VoiceClient {
       return;
     }
 
+    if (this.transcribing) {
+      this.ctx.logger.info("voice: dropping an utterance — a transcription is already in flight", {
+        userId,
+      });
+      return;
+    }
+
     let transcript: string;
+    this.transcribing = true;
     try {
       transcript = await this.stt.transcribeUtterance(pcm);
     } catch (err) {
@@ -348,6 +374,8 @@ export class VoiceClient {
         error: err instanceof Error ? err.message : String(err),
       });
       return;
+    } finally {
+      this.transcribing = false;
     }
 
     // Transcription is the long wait in this pipeline, and stopping the client

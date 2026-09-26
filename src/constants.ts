@@ -48,6 +48,18 @@ export const DEFAULT_CONFIG = {
   tridailyTimes: "07:00,13:00,19:00",
   companyChannels: {} as Record<string, string>,
   approvalsChannels: {} as Record<string, string>,
+  agentBots: [] as Array<{ agentId: string; botTokenRef: unknown; channelId: string }>,
+  hannaDiscordUserId: "",
+  accomplishmentsChannelId: "",
+  milestonesChannelId: "",
+  // Local Whisper (whisper.cpp) config for voice transcription. Defaults match
+  // the runtime measured and approved for the target laptop; see
+  // src/voice/stt-whisper.ts, whose own constants these mirror.
+  whisperBinaryPath: "/opt/homebrew/bin/whisper-cli",
+  ffmpegPath: "/opt/homebrew/bin/ffmpeg",
+  whisperModelPath: "~/.cache/whisper/ggml-large-v3-turbo-q8_0.bin",
+  whisperLanguage: "en",
+  voiceInboxIssueId: "",
 } as const;
 
 export const DISCORD_API_BASE = "https://discord.com/api/v10";

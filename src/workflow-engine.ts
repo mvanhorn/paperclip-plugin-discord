@@ -9,29 +9,23 @@ import { paperclipFetch } from "./paperclip-fetch.js";
 
 export interface WorkflowStep {
   id?: string;
+  // "invoke_agent" and "create_issue" are removed (plan item 6): the v1
+  // runaway came from agents waking agents, so no workflow step lets one
+  // spawn an agent invocation or create a new issue.
   type:
     | "fetch_issue"
-    | "invoke_agent"
     | "http_request"
     | "send_message"
-    | "create_issue"
     | "wait_approval"
     | "set_state";
   // Per-step config (varies by type)
   issueId?: string;
-  agentId?: string;
-  prompt?: string;
   url?: string;
   method?: string;
   headers?: Record<string, string>;
   body?: string;
   message?: string;
   channelId?: string;
-  title?: string;
-  description?: string;
-  projectId?: string;
-  parentId?: string;
-  assigneeAgentId?: string;
   stateKey?: string;
   stateValue?: string;
   approvalMessage?: string;
@@ -139,27 +133,6 @@ async function execFetchIssue(
   }
 }
 
-async function execInvokeAgent(
-  ctx: PluginContext,
-  step: WorkflowStep,
-  wfCtx: WorkflowContext,
-  companyId: string,
-): Promise<StepResult> {
-  const agentId = interpolate(step.agentId ?? "", wfCtx);
-  const prompt = interpolate(step.prompt ?? "", wfCtx);
-  if (!agentId) return { ok: false, error: "Missing agentId" };
-
-  try {
-    await ctx.agents.invoke(agentId, companyId, {
-      prompt,
-      reason: "Workflow step: invoke_agent",
-    });
-    return { ok: true, result: { invoked: agentId, prompt } };
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
-  }
-}
-
 async function execHttpRequest(
   ctx: PluginContext,
   step: WorkflowStep,
@@ -225,40 +198,6 @@ async function execSendMessage(
   return msgId
     ? { ok: true, result: { messageId: msgId, channelId } }
     : { ok: false, error: "Failed to send message" };
-}
-
-async function execCreateIssue(
-  ctx: PluginContext,
-  step: WorkflowStep,
-  wfCtx: WorkflowContext,
-  companyId: string,
-  baseUrl: string,
-  apiKey: string,
-): Promise<StepResult> {
-  const title = interpolate(step.title ?? "", wfCtx);
-  if (!title) return { ok: false, error: "Missing title" };
-
-  const payload: Record<string, unknown> = {
-    title,
-    description: interpolate(step.description ?? "", wfCtx),
-    status: "todo",
-  };
-  if (step.projectId) payload.projectId = interpolate(step.projectId, wfCtx);
-  if (step.parentId) payload.parentId = interpolate(step.parentId, wfCtx);
-  if (step.assigneeAgentId) payload.assigneeAgentId = interpolate(step.assigneeAgentId, wfCtx);
-
-  try {
-    const resp = await paperclipFetch(`${baseUrl}/api/companies/${companyId}/issues`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }, apiKey);
-    if (!resp.ok) return { ok: false, error: `API ${resp.status}` };
-    const data = await resp.json();
-    return { ok: true, result: data };
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
-  }
 }
 
 async function execWaitApproval(
@@ -396,17 +335,11 @@ export async function runWorkflow(opts: WorkflowRunOptions): Promise<{
       case "fetch_issue":
         result = await execFetchIssue(ctx, step, wfCtx, baseUrl, paperclipBoardApiKey);
         break;
-      case "invoke_agent":
-        result = await execInvokeAgent(ctx, step, wfCtx, companyId);
-        break;
       case "http_request":
         result = await execHttpRequest(ctx, step, wfCtx);
         break;
       case "send_message":
         result = await execSendMessage(ctx, step, wfCtx, token, channelId);
-        break;
-      case "create_issue":
-        result = await execCreateIssue(ctx, step, wfCtx, companyId, baseUrl, paperclipBoardApiKey);
         break;
       case "wait_approval":
         result = await execWaitApproval(ctx, step, wfCtx, token, channelId, workflow.name, i, companyId);

@@ -85,6 +85,11 @@ vi.mock("../src/voice/index.js", () => ({
     voiceModule.onImport?.();
     return MockVoiceClient;
   },
+  // The worker constructs this itself (see startVoiceIfConfigured) and hands
+  // it to VoiceClient; the mock only needs to exist, never to transcribe.
+  WhisperSTTAdapter: class MockWhisperSTTAdapter {
+    transcribeUtterance = vi.fn().mockResolvedValue("");
+  },
 }));
 
 class MockVoiceClient {
@@ -124,6 +129,23 @@ function storedConfig(overrides: Record<string, unknown> = {}) {
     enableEscalations: false,
     enableCommands: false,
     digestMode: "off",
+    // This file is not about the allowlist itself (see author-allowlist.test.ts) —
+    // it is about everything downstream of a message the allowlist already let
+    // through. The allowlist now fails closed, so every message here (typed
+    // reply or voice, both authored "u1" after the replace above) needs a
+    // configured operator or it is dropped before any of this file's own
+    // behavior ever runs.
+    hannaDiscordUserId: "u1",
+    // Test-only bridge: this suite historically used
+    // DISCORD_VOICE_DEFAULT_ISSUE_ID as "give voice somewhere to route to".
+    // Plan item 9 replaced that env var with the standing voice-inbox config
+    // field, so setting the env var here configures the inbox directly —
+    // most of the file's existing setup keeps testing the same intent
+    // ("voice has a destination") against the new two-tier resolution
+    // (last-replied-thread, then this inbox).
+    ...(process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID
+      ? { voiceInboxIssueId: process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID }
+      : {}),
     ...overrides,
   };
 }
@@ -140,7 +162,8 @@ function buildHost() {
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
     state: {
       get: vi.fn(async (key: any) => {
-        if (holdPointerRead && String(key.stateKey).startsWith("voice_target_")) {
+        // Plan item 9 reads the last-replied-thread pointer, not a channel target.
+        if (holdPointerRead && String(key.stateKey) === "last_replied_thread") {
           await holdPointerRead;
         }
         return stateStore.get(`${key.scopeKind}:${key.scopeId ?? ""}:${key.stateKey}`) ?? null;
@@ -209,7 +232,7 @@ function definition(): any {
 /** One finished utterance, as the voice client hands it over. */
 function utterance(text = "ship the release") {
   return {
-    userId: "speaker-7",
+    userId: "u1",
     text,
     durationSec: 1.2,
     finalizedAt: new Date().toISOString(),
@@ -258,7 +281,6 @@ beforeEach(() => {
   process.env.DISCORD_VOICE_GUILD_ID = "guild-1";
   process.env.DISCORD_VOICE_CHANNEL_ID = "voice-chan-1";
   process.env.DISCORD_VOICE_WEBHOOK_URL = "https://discord.test/api/webhooks/1/webhook-secret";
-  process.env.DEEPGRAM_API_KEY = "deepgram-secret";
   delete process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID;
 
   webhookLookup = { ok: true, channelId: TEXT_CHANNEL };
@@ -290,7 +312,6 @@ afterEach(() => {
     "DISCORD_VOICE_GUILD_ID",
     "DISCORD_VOICE_CHANNEL_ID",
     "DISCORD_VOICE_WEBHOOK_URL",
-    "DEEPGRAM_API_KEY",
     "DISCORD_VOICE_DEFAULT_ISSUE_ID",
     "DISCORD_VOICE_USERNAME",
   ]) {
@@ -338,7 +359,7 @@ describe("inbound ingress — one path for typed replies and voice (F1)", () => 
     await host.deliver();
 
     await voiceConfig().ingestUtterance({
-      userId: "speaker-7",
+      userId: "u1",
       text: "ship the release",
       durationSec: 1.2,
       finalizedAt: new Date().toISOString(),
@@ -350,7 +371,7 @@ describe("inbound ingress — one path for typed replies and voice (F1)", () => 
     expect(String(url)).toContain(`/api/issues/${VOICE_ISSUE}/comments`);
     expect(JSON.parse(String(init.body))).toMatchObject({
       body: "ship the release",
-      authorUserId: "discord:voice:speaker-7",
+      authorUserId: "discord:voice:u1",
     });
   });
 
@@ -361,7 +382,7 @@ describe("inbound ingress — one path for typed replies and voice (F1)", () => 
     await host.deliver(COMPANY_A);
 
     await voiceConfig().ingestUtterance({
-      userId: "speaker-7",
+      userId: "u1",
       text: "hello",
       durationSec: 1,
       finalizedAt: new Date().toISOString(),
@@ -379,7 +400,7 @@ describe("inbound ingress — one path for typed replies and voice (F1)", () => 
     await host.deliver();
 
     await voiceConfig().ingestUtterance({
-      userId: "speaker-7",
+      userId: "u1",
       text: "nowhere to go",
       durationSec: 1,
       finalizedAt: new Date().toISOString(),
@@ -465,6 +486,65 @@ describe("inbound ingress — one path for typed replies and voice (F1)", () => 
     expect(commentPosts()).toHaveLength(0);
   });
 
+  it("logs a no-destination outcome and tells the author in Discord (silent-failure review B2)", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    await gateway().onMessage(typedMessage());
+
+    expect(host.ctx.logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("did not reach an issue"),
+      expect.objectContaining({
+        outcome: "no-destination",
+        channelId: "chan-1",
+        threadKey: "reply:chan-1:msg-1",
+        author: "discord:alice",
+      }),
+    );
+    const notePosts = host.ctx.http.fetch.mock.calls.filter(
+      ([url]: any[]) => String(url).includes("/messages") && !String(url).includes("/webhooks/"),
+    );
+    expect(notePosts).toHaveLength(1);
+    expect(String(notePosts[0]![1].body)).toContain("did not reach a Paperclip issue");
+  });
+
+  it("logs a rejected outcome and tells the author in Discord (silent-failure review B2)", async () => {
+    commentPostFails = true;
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    host.stateStore.set("instance::msg_chan-1_msg-1", {
+      entityId: "issue-9",
+      entityType: "issue",
+      companyId: COMPANY_A,
+    });
+    await gateway().onMessage(typedMessage());
+
+    expect(host.ctx.logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("did not reach an issue"),
+      expect.objectContaining({ outcome: "rejected" }),
+    );
+    const notePosts = host.ctx.http.fetch.mock.calls.filter(
+      ([url]: any[]) => String(url).includes("/messages") && !String(url).includes("/webhooks/"),
+    );
+    expect(notePosts).toHaveLength(1);
+  });
+
+  it("does not log or post a note for an empty reply — there is nothing to report", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    await gateway().onMessage(typedMessage({ content: "   " }));
+
+    expect(host.ctx.logger.info).not.toHaveBeenCalledWith(
+      expect.stringContaining("did not reach an issue"),
+      expect.anything(),
+    );
+  });
+
   it("drops an utterance that transcribed to whitespace", async () => {
     process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
     const host = buildHost();
@@ -472,7 +552,7 @@ describe("inbound ingress — one path for typed replies and voice (F1)", () => 
     await host.deliver();
 
     await voiceConfig().ingestUtterance({
-      userId: "speaker-7",
+      userId: "u1",
       text: "   ",
       durationSec: 1,
       finalizedAt: new Date().toISOString(),
@@ -483,47 +563,68 @@ describe("inbound ingress — one path for typed replies and voice (F1)", () => 
   });
 });
 
-describe("voice destination — channel target, then configured default", () => {
-  it("writes a channel voice target every time it posts a notification", async () => {
+describe("voice destination — thread Hanna last replied in, then the standing inbox (plan item 9)", () => {
+  it("routes an utterance to the issue of the thread Hanna last replied in", async () => {
     const host = buildHost();
     await definition().setup(host.ctx);
     await host.deliver();
 
-    await host.notifyIssue(COMPANY_A, CHANNEL_ISSUE);
-
-    expect(host.stateStore.get(`instance::voice_target_${TEXT_CHANNEL}`)).toMatchObject({
-      entityId: CHANNEL_ISSUE,
+    host.stateStore.set("instance::msg_chan-1_msg-1", {
+      entityId: "issue-9",
       entityType: "issue",
       companyId: COMPANY_A,
     });
+    // A typed reply from Hanna — this is what "last replied in" tracks.
+    await gateway().onMessage(typedMessage());
+
+    await voiceConfig().ingestUtterance(utterance());
+
+    expect(commentPosts()).toHaveLength(2);
+    expect(String(commentPosts()[1][0])).toContain("/api/issues/issue-9/comments");
   });
 
-  it("prefers what the transcript's channel is currently about", async () => {
+  it("moves to whichever thread Hanna replied in most recently", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    host.stateStore.set("instance::msg_chan-1_msg-1", {
+      entityId: "issue-9",
+      entityType: "issue",
+      companyId: COMPANY_A,
+    });
+    host.stateStore.set("instance::msg_chan-1_msg-2", {
+      entityId: "issue-later",
+      entityType: "issue",
+      companyId: COMPANY_A,
+    });
+    await gateway().onMessage(typedMessage());
+    await gateway().onMessage(
+      typedMessage({ id: "msg-3", message_reference: { message_id: "msg-2", channel_id: "chan-1" } }),
+    );
+
+    await voiceConfig().ingestUtterance(utterance());
+
+    expect(String(commentPosts().at(-1)![0])).toContain("/api/issues/issue-later/comments");
+  });
+
+  it("never lets a live #talk utterance become its own last-replied target", async () => {
     process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
     const host = buildHost();
     await definition().setup(host.ctx);
     await host.deliver();
-    await host.notifyIssue(COMPANY_A, CHANNEL_ISSUE);
 
-    await voiceConfig().ingestUtterance(utterance());
+    await voiceConfig().ingestUtterance(utterance("first"));
+    await voiceConfig().ingestUtterance(utterance("second"));
 
-    expect(commentPosts()).toHaveLength(1);
-    expect(String(commentPosts()[0][0])).toContain(`/api/issues/${CHANNEL_ISSUE}/comments`);
+    // Both utterances land on the standing inbox — the first one routing
+    // there must not itself become "the thread Hanna last replied in".
+    expect(commentPosts()).toHaveLength(2);
+    expect(String(commentPosts()[0][0])).toContain(`/api/issues/${VOICE_ISSUE}/comments`);
+    expect(String(commentPosts()[1][0])).toContain(`/api/issues/${VOICE_ISSUE}/comments`);
   });
 
-  it("moves with the channel — last notification wins", async () => {
-    const host = buildHost();
-    await definition().setup(host.ctx);
-    await host.deliver();
-
-    await host.notifyIssue(COMPANY_A, CHANNEL_ISSUE);
-    await host.notifyIssue(COMPANY_A, "issue-later");
-    await voiceConfig().ingestUtterance(utterance());
-
-    expect(String(commentPosts()[0][0])).toContain("/api/issues/issue-later/comments");
-  });
-
-  it("falls back to the configured default when the channel has no target", async () => {
+  it("falls back to the standing voice inbox when there is no reply yet", async () => {
     process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
     const host = buildHost();
     await definition().setup(host.ctx);
@@ -626,7 +727,11 @@ describe("voice destination — channel target, then configured default", () => 
     expect(health.message).toContain("display-only");
     expect(health.message).not.toContain("webhook-secret");
 
+    // The inbox is plugin config, read at delivery time, not the environment
+    // read live — so giving voice somewhere to route to now takes a fresh
+    // config delivery, not just setting the env var.
     process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
+    await host.deliver();
     await voiceConfig().ingestUtterance(utterance());
     health = await definition().onHealth();
     expect(health.status).toBe("ok");
@@ -662,6 +767,80 @@ describe("voice destination — channel target, then configured default", () => 
     await gateway().onMessage(typedMessage());
 
     expect(String(commentPosts()[0][0])).toContain("/api/issues/issue-9/comments");
+  });
+});
+
+describe("standing voice inbox — created once, assigned to Emery (plan item 9)", () => {
+  function mockIssueCreation(issueId: string) {
+    fetchMock.mockImplementation(async (url: any, init: any) => {
+      const u = String(url);
+      if (u.includes("/api/webhooks/")) {
+        return {
+          ok: webhookLookup.ok,
+          status: webhookLookup.ok ? 200 : 404,
+          headers: new Headers(),
+          json: async () => ({ id: "1", channel_id: webhookLookup.channelId }),
+          text: async () => "",
+        };
+      }
+      if (u.endsWith("/issues") && init?.method === "POST") {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({ id: issueId }),
+          text: async () => "",
+        };
+      }
+      return {
+        ok: !commentPostFails,
+        status: commentPostFails ? 404 : 200,
+        headers: new Headers(),
+        json: async () => ({}),
+        text: async () => (commentPostFails ? "issue not found" : ""),
+      };
+    });
+  }
+
+  it("creates the inbox once, assigned to Emery, and reuses it for later utterances", async () => {
+    mockIssueCreation("voice-inbox-created-1");
+    const host = buildHost();
+    host.ctx.agents.list.mockResolvedValue([{ id: "agent-emery", name: "Emery" }]);
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    await voiceConfig().ingestUtterance(utterance("one"));
+    await voiceConfig().ingestUtterance(utterance("two"));
+
+    expect(commentPosts()).toHaveLength(2);
+    for (const [url] of commentPosts()) {
+      expect(String(url)).toContain("/api/issues/voice-inbox-created-1/comments");
+    }
+
+    const issueCreationCalls = fetchMock.mock.calls.filter(
+      ([url, init]: any[]) => String(url).endsWith("/issues") && init?.method === "POST",
+    );
+    expect(issueCreationCalls).toHaveLength(1);
+    const created = JSON.parse(String(issueCreationCalls[0][1].body));
+    expect(created).toMatchObject({ title: "Hanna voice inbox", assigneeAgentId: "agent-emery" });
+
+    expect(host.stateStore.get(`company:${COMPANY_A}:voice_inbox_issue_id`)).toBe("voice-inbox-created-1");
+  });
+
+  it("ingests nothing when Emery cannot be found and no inbox is configured", async () => {
+    mockIssueCreation("voice-inbox-created-1");
+    const host = buildHost();
+    // Default host.ctx.agents.list() resolves []: no Emery to assign.
+    await definition().setup(host.ctx);
+    await host.deliver();
+
+    await voiceConfig().ingestUtterance(utterance());
+
+    expect(commentPosts()).toHaveLength(0);
+    expect(host.ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("could not find Emery"),
+      expect.anything(),
+    );
   });
 });
 
@@ -858,10 +1037,10 @@ describe("webhook channel resolution is single-flight (N2)", () => {
   });
 
   it("caches a resolved channel for the life of the session", async () => {
+    process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
     const host = buildHost();
     await definition().setup(host.ctx);
     await host.deliver();
-    await host.notifyIssue(COMPANY_A, CHANNEL_ISSUE);
 
     await voiceConfig().ingestUtterance(utterance("one"));
     await voiceConfig().ingestUtterance(utterance("two"));
@@ -913,7 +1092,10 @@ describe("voice health: connectivity and routing are independent (N3)", () => {
     await voiceConfig().ingestUtterance(utterance());
     expect((await definition().onHealth()).status).toBe("degraded");
 
+    // Config, read at delivery time — a fresh delivery is what "gives voice
+    // somewhere to route to" now, not just setting the env var.
     process.env.DISCORD_VOICE_DEFAULT_ISSUE_ID = VOICE_ISSUE;
+    await host.deliver();
     await voiceConfig().ingestUtterance(utterance());
     expect((await definition().onHealth()).status).toBe("ok");
   });
@@ -1051,7 +1233,7 @@ describe("voice lifecycle in the worker (F2, F5)", () => {
   });
 
   it("does not ask for the voice intent when voice is not configured", async () => {
-    delete process.env.DEEPGRAM_API_KEY;
+    delete process.env.DISCORD_VOICE_WEBHOOK_URL;
     const host = buildHost();
     await definition().setup(host.ctx);
     await host.deliver();
@@ -1062,7 +1244,7 @@ describe("voice lifecycle in the worker (F2, F5)", () => {
   });
 
   it("degrades health when the voice client cannot start, without naming a secret", async () => {
-    voiceModule.startRejectsWith = new Error("joining wss://voice.test failed for deepgram-secret");
+    voiceModule.startRejectsWith = new Error("joining wss://voice.test failed for model-path-secret");
     const host = buildHost();
     await definition().setup(host.ctx);
     await host.deliver();
@@ -1070,7 +1252,7 @@ describe("voice lifecycle in the worker (F2, F5)", () => {
     const health = await definition().onHealth();
     expect(health.status).toBe("degraded");
     expect(health.details).toMatchObject({ issue: "discord-voice-unavailable" });
-    expect(health.message).not.toContain("deepgram-secret");
+    expect(health.message).not.toContain("model-path-secret");
     expect(health.message).not.toContain("webhook-secret");
   });
 
@@ -1129,12 +1311,12 @@ describe("voice lifecycle in the worker (F2, F5)", () => {
     expect(health.details).toMatchObject({ issue: "discord-voice-unavailable" });
     expect(health.message).toContain("gateway is not connected");
     expect(health.message).not.toContain("webhook-secret");
-    expect(health.message).not.toContain("deepgram-secret");
+    expect(health.message).not.toContain("model-path-secret");
   });
 
   it("leaves health ok when voice is not configured and the gateway has no voice surface", async () => {
     gatewayState.inert = true;
-    delete process.env.DEEPGRAM_API_KEY;
+    delete process.env.DISCORD_VOICE_WEBHOOK_URL;
     const host = buildHost();
     await definition().setup(host.ctx);
     await host.deliver();

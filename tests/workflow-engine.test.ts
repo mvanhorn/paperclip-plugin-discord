@@ -172,30 +172,22 @@ describe("runWorkflow — step types", () => {
     expect(result.error).toBe("Missing issueId");
   });
 
-  it("invoke_agent calls ctx.agents.invoke", async () => {
+  // invoke_agent is removed (plan item 6): no workflow step lets an agent
+  // spawn another agent invocation. A stored workflow that still names it
+  // (e.g. from before the upgrade) fails that one step cleanly rather than
+  // silently invoking anything.
+  it("invoke_agent is an unknown step type, not silently executed", async () => {
     const ctx = makeCtx();
     const wf: Workflow = {
       name: "test",
-      steps: [{ type: "invoke_agent", agentId: "agent-1", prompt: "hello" }],
-      createdAt: new Date().toISOString(),
-    };
-
-    const result = await runWorkflow({ ...baseOpts, ctx, workflow: wf, args: "" });
-    expect(result.ok).toBe(true);
-    expect(ctx.agents.invoke).toHaveBeenCalledWith("agent-1", "company-1", expect.objectContaining({ prompt: "hello" }));
-  });
-
-  it("invoke_agent fails without agentId", async () => {
-    const ctx = makeCtx();
-    const wf: Workflow = {
-      name: "test",
-      steps: [{ type: "invoke_agent" }],
+      steps: [{ type: "invoke_agent" as any, agentId: "agent-1", prompt: "hello" } as any],
       createdAt: new Date().toISOString(),
     };
 
     const result = await runWorkflow({ ...baseOpts, ctx, workflow: wf, args: "" });
     expect(result.ok).toBe(false);
-    expect(result.error).toBe("Missing agentId");
+    expect(result.error).toBe("Unknown step type: invoke_agent");
+    expect(ctx.agents.invoke).not.toHaveBeenCalled();
   });
 
   it("http_request makes fetch call via ctx.http.fetch", async () => {
@@ -246,48 +238,20 @@ describe("runWorkflow — step types", () => {
     expect(result.error).toBe("Missing message");
   });
 
-  it("create_issue fails without title", async () => {
+  // create_issue is removed (plan item 6): no workflow step lets an agent
+  // create a new issue. Same "unknown step type" treatment as invoke_agent.
+  it("create_issue is an unknown step type, not silently executed", async () => {
     const ctx = makeCtx();
     const wf: Workflow = {
       name: "test",
-      steps: [{ type: "create_issue" }],
-      createdAt: new Date().toISOString(),
-    };
-
-    const result = await runWorkflow({ ...baseOpts, ctx, workflow: wf, args: "" });
-    expect(result.ok).toBe(false);
-    expect(result.error).toBe("Missing title");
-  });
-
-  it("create_issue calls API with payload", async () => {
-    const ctx = makeCtx();
-    mockPaperclipFetch.mockResolvedValue({
-      ok: true, status: 201,
-      json: () => Promise.resolve({ id: "new-issue" }),
-      headers: { get: () => "application/json" },
-    });
-
-    const wf: Workflow = {
-      name: "test",
-      steps: [{
-        type: "create_issue",
-        title: "Bug: {{arg0}}",
-        description: "Created by workflow",
-        projectId: "proj-1",
-      }],
+      steps: [{ type: "create_issue" as any, title: "Bug: {{arg0}}" } as any],
       createdAt: new Date().toISOString(),
     };
 
     const result = await runWorkflow({ ...baseOpts, ctx, workflow: wf, args: "login-broken" });
-    expect(result.ok).toBe(true);
-    expect(mockPaperclipFetch).toHaveBeenCalledWith(
-      expect.stringContaining("/api/companies/company-1/issues"),
-      expect.objectContaining({
-        method: "POST",
-        body: expect.stringContaining("Bug: login-broken"),
-      }),
-      expect.any(String),
-    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe("Unknown step type: create_issue");
+    expect(mockPaperclipFetch).not.toHaveBeenCalled();
   });
 
   it("set_state stores value in workflow context", async () => {

@@ -46,6 +46,9 @@ const storedConfig = {
   enableInbound: false,
   enableCommands: false,
   digestMode: "off",
+  // Not what this smoke test is about (see author-allowlist.test.ts) —
+  // configured so health lands on "ok", not "degraded: no operator".
+  hannaDiscordUserId: "77777777-7777-7777-7777-777777777777",
 };
 
 function buildGatedHost() {
@@ -113,7 +116,9 @@ describe("gated-host smoke: install to running", () => {
 
     // 2. Everything is registered even though no config could be read.
     expect(registered.jobs.length).toBeGreaterThanOrEqual(5);
-    expect(registered.tools.length).toBeGreaterThanOrEqual(6);
+    // 2 tools remain after plan item 6 removed handoff_to_agent,
+    // discuss_with_agent, register_custom_command, and register_watch.
+    expect(registered.tools.length).toBeGreaterThanOrEqual(2);
     expect(registered.actions).toContain("trigger-backfill");
     expect(registered.data).toContain("channel-mapping");
 
