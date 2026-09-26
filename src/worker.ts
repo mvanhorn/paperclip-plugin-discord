@@ -29,7 +29,13 @@ import {
   formatAgentRunFinished,
   humanizePriority,
 } from "./formatters.js";
-import { handleInteraction, SLASH_COMMANDS, type CommandContext } from "./commands.js";
+import {
+  handleInteraction,
+  SLASH_COMMANDS,
+  DELIVERY_ACCEPT_PREFIX,
+  DELIVERY_CHANGES_PREFIX,
+  type CommandContext,
+} from "./commands.js";
 import { runIntelligenceScan, runBackfill } from "./intelligence.js";
 import {
   connectGateway,
@@ -472,8 +478,19 @@ function interactionAuthorId(interaction: unknown): string | null {
   return normalizeDiscordId(member?.user?.id);
 }
 
-/** The ephemeral refusal an interaction from a non-operator author gets. */
-function unauthorizedInteractionResponse(): unknown {
+/**
+ * The ephemeral refusal an interaction from a non-operator author gets.
+ *
+ * It is logged as well as refused. The decision buttons sit in a channel other
+ * people can see, so someone pressing Accept is a fact worth a record: without
+ * one the refusal leaves no trace anywhere.
+ */
+function unauthorizedInteractionResponse(ctx: PluginContext, interaction: unknown): unknown {
+  const data = (interaction as { data?: { custom_id?: unknown; name?: unknown } } | null)?.data;
+  ctx.logger.warn("Discord interaction refused: the author is not the configured operator", {
+    authorId: interactionAuthorId(interaction),
+    customId: String(data?.custom_id ?? data?.name ?? ""),
+  });
   return respondToInteraction({
     type: 4,
     content: "This bot only takes commands from its configured operator.",
@@ -798,12 +815,45 @@ const BOARD_WAKE_STATUSES = new Set(["in_review", "blocked"]);
 /** The pseudo-user an issue is assigned to while it waits on the board. */
 const BOARD_ASSIGNEE = "local-board";
 
+/** The status that makes a board wake a delivery Hanna can decide in place. */
+const DELIVERY_STATUS = "in_review";
+
+/**
+ * The action row on a delivery post. Both custom_ids carry the issue's own
+ * id, because that is what `PATCH /api/issues/:id` takes; the handlers are
+ * `handleButtonClick` and `handleModalSubmit` in commands.ts.
+ */
+function deliveryActionRow(issueId: string): DiscordComponent[] {
+  return [
+    {
+      type: 1,
+      components: [
+        { type: 2, style: 3, label: "Accept", custom_id: `${DELIVERY_ACCEPT_PREFIX}${issueId}` },
+        { type: 2, style: 2, label: "Request changes", custom_id: `${DELIVERY_CHANGES_PREFIX}${issueId}` },
+      ],
+    },
+  ];
+}
+
 /**
  * Outbound trigger 1 from the spec's "Message flow": an issue moves to
- * `in_review` or `blocked`, assigned to `local-board`. The assignee's own bot
- * posts the agent's ask and mentions the configured operator. This is the
- * only event that ever posts that mention. If no agent bot and channel match,
- * the wake is dropped rather than sent through the default channel.
+ * `in_review` or `blocked`, assigned to `local-board`. This is the only event
+ * that ever posts the operator mention.
+ *
+ * `in_review` is a delivery waiting on a decision. The plugin's own bot posts
+ * it to the approvals channel with the Accept / Request changes buttons, so
+ * Hanna decides it from Discord instead of the Paperclip UI. That channel
+ * follows the same precedence `approval.created` uses, through
+ * `resolveChannel`: the `/clip connect-channel` state override, then the
+ * per-company `approvalsChannels` map, then `companyChannels`, then the global
+ * `approvalsChannelId`, and last the assignee bot's channel — where it still
+ * carries the buttons. `blocked` is unchanged: the assignee's own
+ * bot posts the ask in its own channel, with no buttons, and the wake is
+ * dropped when no agent bot and channel match rather than going to the
+ * default channel.
+ *
+ * One poster, not two: a review round that produced a post here must never
+ * also produce a second one, so the dedup marker below covers both shapes.
  *
  * Opt-in: with no `hannaDiscordUserId` configured there is no one to mention,
  * so this never fires — matching upstream, which has no such event at all.
@@ -828,9 +878,25 @@ async function notifyBoardWake(
   const previousMarker = (await ctx.state.get({ scopeKind: "instance", stateKey })) as string | null;
   if (previousMarker === marker) return;
 
+  const isDelivery = status === DELIVERY_STATUS;
+
   const agentId = typeof payload.assigneeAgentId === "string" ? payload.assigneeAgentId : null;
   const outboundBot = resolveOutboundBot(rt, agentId);
-  if (!outboundBot.channelId) {
+  // A delivery's channel runs the full `resolveChannel` precedence, exactly as
+  // `approval.created` does: the two channel overrides outrank the global
+  // `approvalsChannelId`, and the assignee bot's channel is only the last
+  // resort. Resolving before the guard below means a company that configures
+  // `approvalsChannels` alone still gets its delivery, rather than silently
+  // falling through to the assignee bot's channel or being dropped.
+  const deliveryChannelId = isDelivery
+    ? await resolveChannel(
+        ctx,
+        event.companyId,
+        rt.approvalsChannelId || outboundBot.channelId,
+        rt.config.approvalsChannels,
+      )
+    : null;
+  if (!deliveryChannelId && !outboundBot.channelId) {
     ctx.logger.warn("board-wake: no agent bot/channel resolved, dropping the wake", {
       issueId: event.entityId,
       companyId: event.companyId,
@@ -838,7 +904,8 @@ async function notifyBoardWake(
     });
     return;
   }
-  const channelId = await resolveChannel(ctx, event.companyId, outboundBot.channelId);
+  const channelId =
+    deliveryChannelId ?? (await resolveChannel(ctx, event.companyId, outboundBot.channelId));
   if (!channelId) {
     ctx.logger.warn("board-wake: no channel resolved, dropping the wake", {
       issueId: event.entityId,
@@ -851,15 +918,49 @@ async function notifyBoardWake(
   // Claim before the post, so a concurrent handler for the same wake skips.
   await ctx.state.set(scope, marker);
 
-  const askText = String(payload.lastComment ?? payload.title ?? "").trim();
+  // A delivery puts the title in its own heading, so it never repeats it here
+  // as a stand-in for a missing hand-off comment.
+  const askText = String(payload.lastComment ?? (isDelivery ? "" : payload.title) ?? "").trim();
   const truncatedAsk =
     askText.length > BOARD_WAKE_ASK_LIMIT ? askText.slice(0, BOARD_WAKE_ASK_LIMIT) : askText;
+  // The ask is agent-authored text sitting inches from buttons that decide an
+  // issue. `oneLine` already stops the title forging a line break; the ask
+  // keeps its own line breaks, so it is block-quoted instead — every line of
+  // it reads as quoted text and none of it can pass as the message's own
+  // heading or link. The cut above runs first, so the 1,900-character budget
+  // still measures the agent's text and not the prefixes.
+  const quotedAsk = truncatedAsk.length > 0 ? `> ${truncatedAsk.replace(/\n/g, "\n> ")}` : "";
   const identifier = String(payload.identifier ?? event.entityId);
   const issueUrl = `${rt.baseUrl}/issues/${identifier}`;
   const mention = `<@${rt.hannaDiscordUserId}>`;
-  const content = [mention, truncatedAsk, issueUrl].filter((line) => line.length > 0).join("\n\n");
+  // A delivery names itself: the buttons decide an issue, so the message has
+  // to say which one without following the link.
+  const heading = isDelivery
+    ? `**${identifier}** — ${oneLine(String(payload.title ?? ""))}`
+    : "";
+  const content = [mention, heading, quotedAsk, issueUrl]
+    .filter((line) => line.length > 0)
+    .join("\n\n");
 
-  const messageId = await postEmbedWithId(ctx, outboundBot.token, channelId, { content });
+  const message: DiscordMessage = { content };
+  if (isDelivery) {
+    message.components = deliveryActionRow(String(event.entityId));
+    // The mention has to ping, and nothing else may. `parse: []` resolves no
+    // mention at all, and the explicit `users` list re-admits exactly one: an
+    // `@everyone` or role ping inside the agent's own text stays inert.
+    message.allowed_mentions = { parse: [], users: [rt.hannaDiscordUserId] };
+  }
+
+  // Discord delivers a component interaction only to the application that owns
+  // the message. An agent bot is its own application, and its Gateway
+  // connection here answers every interaction with "This bot does not handle
+  // commands here" (see the agentBots loop in `bootstrapRuntime`), so buttons
+  // posted through one would be dead. A delivery therefore posts through the
+  // plugin's own bot, whose Gateway runs `handleInteraction`. A `blocked` wake
+  // carries no buttons and keeps posting as the assignee's own bot.
+  const postToken = isDelivery ? rt.token : outboundBot.token;
+
+  const messageId = await postEmbedWithId(ctx, postToken, channelId, message);
   if (!messageId) {
     ctx.logger.warn("board-wake: failed to post the wake message to Discord", {
       issueId: event.entityId,
@@ -2279,7 +2380,7 @@ async function bootstrapRuntime(
             });
           }
           if (!isAllowedInboundAuthor(current, interactionAuthorId(interaction))) {
-            return unauthorizedInteractionResponse();
+            return unauthorizedInteractionResponse(ctx, interaction);
           }
           return handleInteraction(ctx, interaction as any, current.cmdCtx);
         },
@@ -3671,7 +3772,7 @@ const plugin = definePlugin({
       }
 
       if (!isAllowedInboundAuthor(rt!, interactionAuthorId(body))) {
-        return unauthorizedInteractionResponse() as unknown as void;
+        return unauthorizedInteractionResponse(ctx, body) as unknown as void;
       }
 
       try {

@@ -356,6 +356,10 @@ describe("board wake — the mention and the message", () => {
     expect(body.content).toContain("https://paperclip.test/issues/SAG-3");
   });
 
+  // `blocked`, not `in_review`: an `in_review` wake is a delivery now, and a
+  // delivery posts through the plugin's own bot so its buttons reach a Gateway
+  // that handles them (see tests/delivery-approval-post.test.ts). The
+  // assignee-bot routing this test covers is unchanged on the `blocked` path.
   it("routes through the assignee agent's own bot when one is mapped", async () => {
     const host = buildHost();
     await definition().setup(host.ctx);
@@ -367,13 +371,13 @@ describe("board wake — the mention and the message", () => {
     host.ctx.issues.get.mockResolvedValue({
       identifier: "SAG-4",
       title: "Coda's ask",
-      status: "in_review",
+      status: "blocked",
       assigneeUserId: "local-board",
       assigneeAgentId: "agent-coda",
       updatedAt: "2026-09-26T01:00:00.000Z",
     });
 
-    await host.issueUpdated({ status: "in_review", assigneeUserId: "local-board", assigneeAgentId: "agent-coda" });
+    await host.issueUpdated({ status: "blocked", assigneeUserId: "local-board", assigneeAgentId: "agent-coda" });
 
     const [url, init] = postedMessages()[0];
     expect(String(url)).toContain("/channels/chan-coda/messages");
@@ -421,13 +425,14 @@ describe("board wake — the mention and the message", () => {
     host.ctx.issues.get.mockResolvedValue({
       identifier: "SAG-6",
       title: "Clay's ask",
-      status: "in_review",
+      // `blocked` for the same reason as the test above.
+      status: "blocked",
       assigneeUserId: "local-board",
       assigneeAgentId: "agent-clay",
       updatedAt: "2026-09-26T01:00:00.000Z",
     });
 
-    await host.issueUpdated({ status: "in_review", assigneeUserId: "local-board", assigneeAgentId: "agent-clay" });
+    await host.issueUpdated({ status: "blocked", assigneeUserId: "local-board", assigneeAgentId: "agent-clay" });
 
     const [url, init] = postedMessages()[0];
     expect(String(url)).toContain("/channels/chan-coda/messages");

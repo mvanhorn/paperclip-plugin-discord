@@ -24,8 +24,13 @@ export interface DiscordMessage {
   content?: string;
   embeds?: DiscordEmbed[];
   components?: DiscordComponent[];
-  /** Discord's allowed_mentions object. `{ parse: [] }` resolves no mention, so no push. */
-  allowed_mentions?: { parse: Array<"users" | "roles" | "everyone"> };
+  /**
+   * Discord's allowed_mentions object. `{ parse: [] }` resolves no mention, so
+   * no push. `users` re-admits named user IDs on top of that: `{ parse: [],
+   * users: [id] }` pings exactly that person and nobody else, whatever the
+   * message text asks for.
+   */
+  allowed_mentions?: { parse: Array<"users" | "roles" | "everyone">; users?: string[] };
 }
 
 export interface DiscordGuildRole {

@@ -4,6 +4,7 @@ import { COLORS, METRIC_NAMES } from "./constants.js";
 import { humanizeStatus } from "./formatters.js";
 import { withRetry, throwOnRetryableStatus } from "./retry.js";
 import { paperclipFetch } from "./paperclip-fetch.js";
+import { summarizeError } from "./runtime-token.js";
 import { handleAcpCommand } from "./session-registry.js";
 import { resolveCompanyId } from "./company-resolver.js";
 import { getEscalation } from "./escalation-state.js";
@@ -24,11 +25,26 @@ interface InteractionOption {
   focused?: boolean;
 }
 
+/**
+ * A message component as Discord sends it back. Only a modal submit carries
+ * these on `data`: one action row (type 1) per field, each holding one text
+ * input (type 4) whose `value` is what the operator typed.
+ */
+interface InteractionComponent {
+  type: number;
+  custom_id?: string;
+  value?: string;
+  components?: InteractionComponent[];
+}
+
 interface InteractionData {
-  name: string;
+  /** Absent on a modal submit (type 5), which carries only `custom_id`. */
+  name?: string;
   custom_id?: string;
   component_type?: number;
   options?: InteractionOption[];
+  /** Modal submit only: the rows of fields the operator filled in. */
+  components?: InteractionComponent[];
 }
 
 interface Interaction {
@@ -352,6 +368,14 @@ export async function handleInteraction(
 
   if (interaction.type === 4 && interaction.data) {
     return handleAutocomplete(ctx, interaction.data, cmdCtx);
+  }
+
+  // Type 5 is MODAL_SUBMIT. The only modal this plugin opens is the
+  // request-changes reason box (see `requestChangesModal`). Both inbound
+  // paths apply the author allowlist before calling in, so this is already
+  // operator-only — see `isAllowedInboundAuthor` in worker.ts.
+  if (interaction.type === 5 && interaction.data) {
+    return handleModalSubmit(ctx, interaction.data, cmdCtx);
   }
 
   return respondToInteraction({
@@ -1229,13 +1253,337 @@ async function handleDigest(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Deciding a delivery from Discord.
+//
+// A delivery waiting on Hanna is an issue at `status: "in_review"`, assigned
+// to `local-board`, with an `approval` execution stage whose current
+// participant is `local-board`. Paperclip has no decision route: the UI
+// resolves the stage through `PATCH /api/issues/:id`, which destructures
+// `comment` as `commentBody`
+// (@paperclipai/server/dist/routes/issues.js:8941 and :8974) and hands it to
+// `applyIssueExecutionPolicyTransition` (:9207). The decision itself is the
+// `principalsEqual(currentParticipant, actor)` branch of
+// `applyIssueExecutionStageTransition`
+// (@paperclipai/server/dist/services/issue-execution-policy.js:604-700).
+// ---------------------------------------------------------------------------
+
+/** Accept button: `delivery_accept_<issueId>`. */
+export const DELIVERY_ACCEPT_PREFIX = "delivery_accept_";
+/** Request-changes button: `delivery_changes_<issueId>`. */
+export const DELIVERY_CHANGES_PREFIX = "delivery_changes_";
+/** The modal that button opens: `delivery_changes_modal_<issueId>`. */
+export const DELIVERY_CHANGES_MODAL_PREFIX = "delivery_changes_modal_";
+/** The one field in that modal. */
+export const DELIVERY_REASON_INPUT_ID = "reason";
+
+/** The pseudo-user an issue is assigned to while it waits on the board. */
+const DELIVERY_BOARD_ASSIGNEE = "local-board";
+
+/**
+ * Approving a stage requires a non-empty comment — the server throws
+ * `unprocessable("Approving a review or approval stage requires a comment…")`
+ * otherwise (issue-execution-policy.js:607). Accepting from Discord carries
+ * no free text, so it sends this fixed line.
+ */
+const DELIVERY_ACCEPT_COMMENT = "Accepted by Hanna from Discord.";
+
+/** Discord's own cap on a modal text input is 4,000; the ask budget here is 1,900. */
+const DELIVERY_REASON_LIMIT = 1900;
+
+/**
+ * A Paperclip issue id is a UUID. The id in a `custom_id` arrives from
+ * Discord, so it is untrusted input that ends up in an API path carrying the
+ * board API key. `fetch` resolves dot segments, so an unchecked
+ * `delivery_accept_../../anything` would send that key to an arbitrary
+ * Paperclip route. Nothing that fails this shape check reaches the network.
+ */
+const DELIVERY_ISSUE_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isDeliveryIssueId(value: string): boolean {
+  return DELIVERY_ISSUE_ID_PATTERN.test(value);
+}
+
+/**
+ * The ephemeral refusal an unusable issue id gets, in place of any API call.
+ * `source` is whatever the id was read out of, for the log.
+ */
+function badDeliveryIdResponse(ctx: PluginContext, source: string): unknown {
+  ctx.logger.warn("delivery decision: the interaction carried no usable issue id", { source });
+  return respondToInteraction({
+    type: 4,
+    content: "This button no longer names an issue Paperclip can decide. Decide it in Paperclip.",
+    ephemeral: true,
+  });
+}
+
+/**
+ * The retry budget for the two calls a decision makes. Discord closes the
+ * acknowledgement window three seconds after the interaction arrives, and
+ * nothing here defers the response, so the GET and the PATCH have to finish
+ * inside it. The default budget (three retries at a 1,000 ms base, doubling)
+ * spends up to seven seconds on one call alone. One retry at 200 ms keeps the
+ * worst case for both calls well under the window.
+ */
+const DELIVERY_RETRY = { maxRetries: 1, baseDelayMs: 200 } as const;
+
+/** What a failed decision call says in the channel. The detail goes to the log. */
+const DELIVERY_READ_FAILED = "Could not read the issue from Paperclip. Try again, or decide it there.";
+const DELIVERY_PATCH_FAILED = "Could not record the decision in Paperclip. Try again, or decide it there.";
+
+/**
+ * An UPDATE_MESSAGE response. `clearButtons` decides whether the action row
+ * goes away: a settled delivery drops it, while a failed call omits
+ * `components` entirely so Discord leaves the existing buttons alone and
+ * Hanna can press again.
+ */
+function deliveryUpdate(
+  title: string,
+  description: string,
+  color: number,
+  clearButtons: boolean,
+): unknown {
+  const data: Record<string, unknown> = {
+    embeds: [
+      {
+        title,
+        description,
+        color,
+        footer: { text: "Paperclip" },
+        timestamp: new Date().toISOString(),
+      },
+    ],
+  };
+  if (clearButtons) data.components = [];
+  return { type: 7, data };
+}
+
+/** The issue as `GET /api/issues/:id` returns it: the row, flattened. */
+interface DeliveryIssue {
+  status?: unknown;
+  assigneeUserId?: unknown;
+}
+
+async function readDeliveryIssue(
+  base: string,
+  issueId: string,
+  apiKey: string,
+): Promise<DeliveryIssue> {
+  const resp = await withRetry(async () => {
+    const r = await paperclipFetch(
+      `${base}/api/issues/${encodeURIComponent(issueId)}`,
+      { method: "GET" },
+      apiKey,
+    );
+    throwOnRetryableStatus(r);
+    return r;
+  }, DELIVERY_RETRY);
+  return (await resp.json()) as DeliveryIssue;
+}
+
+/** True only while the issue is still the delivery the buttons were posted for. */
+function deliveryIsWaiting(issue: DeliveryIssue): boolean {
+  return issue.status === "in_review" && issue.assigneeUserId === DELIVERY_BOARD_ASSIGNEE;
+}
+
+/**
+ * Make the decision. One `GET` first, so a second press — or a press on an
+ * issue the lead has already taken back — changes nothing and says so; then
+ * the `PATCH` the execution-policy service reads the decision off.
+ *
+ * `status: "in_progress"` is the only correct request-changes status: the
+ * `allowBoardOverride` branch (issue-execution-policy.js:655) clears the
+ * execution state for any status other than `in_review`/`in_progress`, which
+ * would destroy the stage instead of returning the issue to its lead. The
+ * transition reassigns the issue to the stage's `returnAssignee` itself.
+ */
+async function decideDelivery(
+  ctx: PluginContext,
+  cmdCtx: CommandContext | undefined,
+  issueId: string,
+  outcome: "approved" | "changes_requested",
+  comment: string,
+): Promise<unknown> {
+  const base = cmdCtx?.baseUrl ?? "http://localhost:3100";
+  const apiKey = cmdCtx?.paperclipBoardApiKey ?? "";
+
+  // Second gate on the id. The callers check it too, so nothing normally
+  // arrives here malformed; this is the one every decision path shares.
+  if (!isDeliveryIssueId(issueId)) return badDeliveryIdResponse(ctx, issueId);
+
+  // The PATCH must authenticate as `local-board` to be the stage's current
+  // participant (@paperclipai/server/dist/middleware/auth.js:151). Without the
+  // key there is no decision to make, so refuse rather than call and fail.
+  if (!apiKey) {
+    ctx.logger.warn("delivery decision: no Paperclip board API key is configured", { issueId, outcome });
+    return respondToInteraction({
+      type: 4,
+      content:
+        "No Paperclip board API key is configured, so a delivery cannot be decided from Discord. Decide it in Paperclip.",
+      ephemeral: true,
+    });
+  }
+
+  let issue: DeliveryIssue;
+  try {
+    issue = await readDeliveryIssue(base, issueId, apiKey);
+  } catch (err) {
+    // The channel line stays non-specific on purpose: this is a type 7
+    // UPDATE_MESSAGE, so it edits the message everyone in the approvals
+    // channel sees, and a `PaperclipFetchError` carries the request URL and
+    // 200 characters of the response body. The detail goes to the log.
+    ctx.logger.error("delivery decision: could not read the issue", {
+      issueId,
+      error: summarizeError(err, [apiKey]),
+    });
+    return deliveryUpdate("Decision Failed", DELIVERY_READ_FAILED, COLORS.RED, false);
+  }
+
+  if (!deliveryIsWaiting(issue)) {
+    ctx.logger.info("delivery decision: the issue is no longer waiting on the board", { issueId, outcome });
+    return deliveryUpdate(
+      "Already Settled",
+      "This delivery is no longer waiting on you, so nothing changed.",
+      COLORS.YELLOW,
+      true,
+    );
+  }
+
+  try {
+    await withRetry(async () => {
+      const r = await paperclipFetch(
+        `${base}/api/issues/${encodeURIComponent(issueId)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            status: outcome === "approved" ? "done" : "in_progress",
+            comment,
+          }),
+        },
+        apiKey,
+      );
+      throwOnRetryableStatus(r);
+      return r;
+    }, DELIVERY_RETRY);
+  } catch (err) {
+    // Non-specific in the channel, detailed in the log — see the read branch.
+    ctx.logger.error("delivery decision: the Paperclip call failed", {
+      issueId,
+      outcome,
+      error: summarizeError(err, [apiKey]),
+    });
+    return deliveryUpdate("Decision Failed", DELIVERY_PATCH_FAILED, COLORS.RED, false);
+  }
+
+  await ctx.metrics.write(METRIC_NAMES.approvalsDecided, 1);
+
+  if (outcome === "approved") {
+    return deliveryUpdate("Delivery Accepted", "Accepted by Hanna", COLORS.GREEN, true);
+  }
+  return deliveryUpdate(
+    "Changes Requested",
+    `Changes requested by Hanna\n\n> ${comment.replace(/\n/g, "\n> ")}`,
+    COLORS.YELLOW,
+    true,
+  );
+}
+
+/** The reason box the request-changes button opens. */
+function requestChangesModal(issueId: string): unknown {
+  return {
+    type: 9,
+    data: {
+      custom_id: `${DELIVERY_CHANGES_MODAL_PREFIX}${issueId}`,
+      title: "Request changes",
+      components: [
+        {
+          type: 1,
+          components: [
+            {
+              type: 4,
+              custom_id: DELIVERY_REASON_INPUT_ID,
+              label: "What needs to change?",
+              style: 2,
+              required: true,
+              max_length: DELIVERY_REASON_LIMIT,
+            },
+          ],
+        },
+      ],
+    },
+  };
+}
+
+/** The value of one field in a submitted modal. */
+function modalFieldValue(rows: InteractionComponent[] | undefined, customId: string): string {
+  for (const row of rows ?? []) {
+    for (const field of row.components ?? []) {
+      if (field.custom_id === customId) return String(field.value ?? "");
+    }
+  }
+  return "";
+}
+
+/**
+ * Interaction type 5. The author allowlist has already run on both inbound
+ * paths, so anything arriving here came from the configured operator.
+ */
+export async function handleModalSubmit(
+  ctx: PluginContext,
+  data: InteractionData,
+  cmdCtx?: CommandContext,
+): Promise<unknown> {
+  const customId = data.custom_id ?? "";
+
+  if (customId.startsWith(DELIVERY_CHANGES_MODAL_PREFIX)) {
+    const issueId = customId.slice(DELIVERY_CHANGES_MODAL_PREFIX.length);
+    if (!isDeliveryIssueId(issueId)) return badDeliveryIdResponse(ctx, customId);
+    const reason = modalFieldValue(data.components, DELIVERY_REASON_INPUT_ID).trim();
+    if (!reason) {
+      // Discord enforces `required` client-side; this covers a whitespace-only
+      // entry, which the server would reject as an empty comment anyway.
+      return respondToInteraction({
+        type: 4,
+        content: "Requesting changes needs a reason. Press the button again and say what to change.",
+        ephemeral: true,
+      });
+    }
+    return decideDelivery(ctx, cmdCtx, issueId, "changes_requested", reason.slice(0, DELIVERY_REASON_LIMIT));
+  }
+
+  ctx.logger.warn("Unknown modal submitted", { customId });
+  return respondToInteraction({
+    type: 4,
+    content: "This form is no longer handled.",
+    ephemeral: true,
+  });
+}
+
 async function handleButtonClick(
   ctx: PluginContext,
   data: InteractionData,
   username?: string,
   cmdCtx?: CommandContext,
 ): Promise<unknown> {
-  const customId = data.custom_id ?? data.name;
+  const customId = data.custom_id ?? data.name ?? "";
+
+  if (customId.startsWith(DELIVERY_ACCEPT_PREFIX)) {
+    const issueId = customId.slice(DELIVERY_ACCEPT_PREFIX.length);
+    if (!isDeliveryIssueId(issueId)) return badDeliveryIdResponse(ctx, customId);
+    ctx.logger.info("Delivery accept button clicked", { issueId });
+    return decideDelivery(ctx, cmdCtx, issueId, "approved", DELIVERY_ACCEPT_COMMENT);
+  }
+
+  // No API call here: the decision waits for the reason the modal collects.
+  if (customId.startsWith(DELIVERY_CHANGES_PREFIX)) {
+    const issueId = customId.slice(DELIVERY_CHANGES_PREFIX.length);
+    if (!isDeliveryIssueId(issueId)) return badDeliveryIdResponse(ctx, customId);
+    ctx.logger.info("Delivery request-changes button clicked", { issueId });
+    return requestChangesModal(issueId);
+  }
+
   const actor = username ?? "Discord user";
   const base = cmdCtx?.baseUrl ?? "http://localhost:3100";
   const token = cmdCtx?.token ?? "";
