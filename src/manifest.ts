@@ -332,6 +332,24 @@ const manifest: PaperclipPluginManifestV1 = {
           "reports itself degraded until this is set.",
         default: DEFAULT_CONFIG.hannaDiscordUserId,
       },
+      discordPublicKey: {
+        type: "string",
+        title: "Discord application public key (required for webhook interactions)",
+        description:
+          "The public key from your Discord application's General Information page: " +
+          "exactly 64 hexadecimal characters. " +
+          "It is PUBLIC, not a secret, so it belongs here rather than in a secret " +
+          "reference. Discord signs every webhook-delivered interaction with the " +
+          "matching private key, and Paperclip's webhook route is unauthenticated — " +
+          "so this is the only thing proving a delivery came from Discord. This fails " +
+          "CLOSED: left empty, every webhook-delivered interaction is dropped " +
+          "unverified and the plugin reports itself degraded once one arrives. " +
+          "An install that receives interactions over the Discord gateway instead " +
+          "needs nothing here. A value that is set but not a usable key is refused " +
+          "when you save, and a delivery whose signed timestamp is more than five " +
+          "minutes old is dropped as a replay.",
+        default: DEFAULT_CONFIG.discordPublicKey,
+      },
       accomplishmentsChannelId: {
         type: "string",
         title: "Accomplishments Channel ID",

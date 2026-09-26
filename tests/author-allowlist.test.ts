@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import crypto from "node:crypto";
 
 // ---------------------------------------------------------------------------
 // Author allowlist (plan item 2, revised — fails closed).
@@ -150,6 +151,41 @@ function baseConfig(overrides: Record<string, unknown> = {}) {
       : {}),
     ...overrides,
   };
+}
+
+/**
+ * A real Ed25519 keypair, with the public key as the 64-char hex Discord
+ * publishes on an application's General Information page.
+ */
+function interactionKeypair() {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+  const spki = publicKey.export({ format: "der", type: "spki" });
+  return { privateKey, publicKeyHex: spki.subarray(spki.length - 32).toString("hex") };
+}
+
+/**
+ * A webhook delivery Discord itself could have sent: the raw body, and the two
+ * signature headers over `timestamp + rawBody`. The plugin verifies this before
+ * anything reads the body, so an unsigned delivery never reaches the allowlist.
+ *
+ * The timestamp is read off the real clock because the gate bounds its age: a
+ * fixed one would make this test expire.
+ */
+function signedInteractionDelivery(privateKey: crypto.KeyObject, interaction: unknown) {
+  const rawBody = JSON.stringify(interaction);
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  return {
+    endpointKey: "discord-interactions",
+    requestId: "req-1",
+    rawBody,
+    parsedBody: JSON.parse(rawBody),
+    headers: {
+      "x-signature-ed25519": crypto
+        .sign(null, Buffer.from(timestamp + rawBody, "utf8"), privateKey)
+        .toString("hex"),
+      "x-signature-timestamp": timestamp,
+    },
+  } as any;
 }
 
 function typedMessage(overrides: Record<string, unknown> = {}) {
@@ -334,20 +370,24 @@ describe("author allowlist — slash commands and button clicks (interactions)",
   });
 
   it("refuses an interaction delivered via the webhook fallback from a non-operator author", async () => {
+    // The webhook delivery is signed with the configured application key, so the
+    // signature gate passes and the allowlist is what refuses it. A signature
+    // proves Discord sent the interaction, never that the right person clicked —
+    // see tests/interactions-webhook-signature.test.ts for the gate itself.
+    const { privateKey, publicKeyHex } = interactionKeypair();
     const host = buildHost();
     await definition().setup(host.ctx);
-    await host.deliver(baseConfig({ hannaDiscordUserId: HANNA_ID }));
+    await host.deliver(baseConfig({ hannaDiscordUserId: HANNA_ID, discordPublicKey: publicKeyHex }));
 
-    const response: any = await definition().onWebhook({
-      endpointKey: "discord-interactions",
-      parsedBody: {
+    const response: any = await definition().onWebhook(
+      signedInteractionDelivery(privateKey, {
         id: "int-1",
         token: "tok",
         type: 2,
         data: { name: "clip", options: [{ name: "status" }] },
         member: { user: { id: OTHER_ID, username: "eve" } },
-      },
-    });
+      }),
+    );
 
     expect(response.data.content).toContain("configured operator");
   });

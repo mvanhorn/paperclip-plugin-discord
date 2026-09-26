@@ -9,6 +9,14 @@ import {
 import { DEFAULT_CONFIG, COLORS, METRIC_NAMES, PLUGIN_ID, WEBHOOK_KEYS, ACP_PLUGIN_EVENT_PREFIX, BUDGET_ALERT_THRESHOLD } from "./constants.js";
 import { paperclipFetch } from "./paperclip-fetch.js";
 import {
+  verifyDiscordWebhookSignature,
+  readSignatureHeader,
+  classifyDiscordPublicKey,
+  normalizeDiscordPublicKey,
+  SIGNATURE_HEADER,
+  TIMESTAMP_HEADER,
+} from "./interaction-signature.js";
+import {
   postEmbed,
   postEmbedWithId,
   getApplicationId,
@@ -149,6 +157,14 @@ type DiscordConfig = {
    * snowflake. Unset (the default) keeps upstream's unrestricted behavior.
    */
   hannaDiscordUserId?: string;
+  /**
+   * The Discord application's public key, 64 hex characters. PUBLIC, not a
+   * secret. Discord signs every webhook-delivered interaction with the matching
+   * private key, and Paperclip's webhook route is unauthenticated, so this is
+   * the only proof a delivery came from Discord. Unset drops every
+   * webhook-delivered interaction. The gateway path does not use it.
+   */
+  discordPublicKey?: string;
   /**
    * Outbound item 4: when a lead's issue reaches `done`, the lead's bot posts
    * one line here. Empty (the default) posts nothing.
@@ -335,6 +351,18 @@ type DiscordRuntime = {
   }>;
   /** Normalized snowflake, or null when the operator has not set one (opt-out). */
   hannaDiscordUserId: string | null;
+  /**
+   * Trimmed, lowercased Discord application public key, or null when it is unset
+   * OR malformed. Null means no webhook-delivered interaction can be verified,
+   * so all of them are dropped — see `onWebhook`.
+   */
+  discordPublicKey: string | null;
+  /**
+   * True when a key WAS configured but cannot be used: wrong length, not hex, or
+   * a low-order Ed25519 encoding. Kept apart from "unset" because the two mean
+   * different things to an operator — see `applyInteractionsHealth`.
+   */
+  discordPublicKeyMalformed: boolean;
   /** Null when unset: no accomplishment posts. */
   accomplishmentsChannelId: string | null;
   /** Null when unset: no milestone posts, and no goal or project reads. */
@@ -385,6 +413,37 @@ const refusedCompanies = new Set<string>();
 const DEDUP_TTL_MS = 5 * 60 * 1000;
 const seenEvents = new Map<string, number>();
 
+/**
+ * How often one interaction-refusal cause may write a log line.
+ *
+ * The webhook route is unauthenticated and the host rate-limits nothing, so an
+ * anonymous caller in a loop would otherwise write one warn per request. The
+ * first occurrence of each cause is always written; repeats inside the window
+ * are not.
+ */
+const INTERACTION_REFUSAL_LOG_WINDOW_MS = 60 * 1000;
+/** Last log time per refusal cause, for the window above. */
+const lastInteractionRefusalLogMs = new Map<string, number>();
+/**
+ * True once a webhook interaction has been dropped because no usable public key
+ * is configured.
+ *
+ * Sticky for the life of the worker, because every bootstrap resets health to
+ * "ok" and the drop is still happening after a reconnect. `applyInteractionsHealth`
+ * re-raises the note from this flag. It stays false on an install that has never
+ * received a webhook delivery, so a gateway-only install gets no false note.
+ */
+let interactionsUnverifiedSeen = false;
+
+/** True when this cause may log now. Records the time when it may. */
+function allowInteractionRefusalLog(cause: string): boolean {
+  const now = Date.now();
+  const last = lastInteractionRefusalLogMs.get(cause);
+  if (last !== undefined && now - last < INTERACTION_REFUSAL_LOG_WINDOW_MS) return false;
+  lastInteractionRefusalLogMs.set(cause, now);
+  return true;
+}
+
 function setRuntimeHealth(health: DiscordRuntimeHealth): void {
   runtimeHealth = health;
 }
@@ -407,6 +466,8 @@ export function _resetRuntimeForTests(): void {
   ownerConfigJson = null;
   refusedCompanies.clear();
   seenEvents.clear();
+  lastInteractionRefusalLogMs.clear();
+  interactionsUnverifiedSeen = false;
   runtimeHealth = {
     status: "degraded",
     message: "Waiting for company-scoped configuration from the host",
@@ -496,6 +557,117 @@ function unauthorizedInteractionResponse(ctx: PluginContext, interaction: unknow
     content: "This bot only takes commands from its configured operator.",
     ephemeral: true,
   });
+}
+
+/** Health issue code: a webhook interaction arrived that could not be verified. */
+const INTERACTIONS_UNVERIFIED_ISSUE = "discord-interactions-unverified";
+/** Health issue code: a public key IS configured, and cannot be used. */
+const INTERACTIONS_KEY_MALFORMED_ISSUE = "discord-interactions-public-key-malformed";
+
+/** The unset-key message. One wording, used at bootstrap and at the gate. */
+const INTERACTIONS_UNSET_MESSAGE =
+  `[${PLUGIN_ID}] the interactions webhook cannot be verified: discordPublicKey is not ` +
+  "configured, so every webhook-delivered Discord interaction is dropped";
+
+/** The malformed-key message. It names the field and never the value. */
+const INTERACTIONS_MALFORMED_MESSAGE =
+  `[${PLUGIN_ID}] discordPublicKey is set to a value that is not a usable Discord ` +
+  "application public key: it must be exactly 64 hexadecimal characters, and must not be " +
+  "one of Ed25519's low-order encodings. Every webhook-delivered Discord interaction is " +
+  "dropped until it is corrected. Copy it from your Discord application's General " +
+  "Information page";
+
+/**
+ * Report the interactions gate through plugin health, once per configuration
+ * delivery, right after `applyInboundAllowlistHealth`.
+ *
+ * Two notes live here, and each is raised for its own reason:
+ *
+ * - A MALFORMED key is wrong on every install, including a gateway-only one, so
+ *   it is raised at bootstrap whether or not a delivery has arrived.
+ * - An UNSET key is raised only once a webhook delivery has actually been
+ *   dropped (`interactionsUnverifiedSeen`). A gateway-only install needs no key,
+ *   so a bootstrap note there would be false noise. The flag is sticky, which is
+ *   what makes this note survive the health reset every bootstrap performs.
+ *
+ * Neither note overwrites an existing degradation: an unrelated failure, a
+ * secret that stopped resolving say, is not this function's to discard. The log
+ * line goes out either way, so nothing is lost when a note is held back.
+ */
+function applyInteractionsHealth(ctx: PluginContext, rt: DiscordRuntime): void {
+  const malformed = rt.discordPublicKeyMalformed;
+  if (!malformed && !(interactionsUnverifiedSeen && !rt.discordPublicKey)) return;
+
+  const message = malformed ? INTERACTIONS_MALFORMED_MESSAGE : INTERACTIONS_UNSET_MESSAGE;
+  const issue = malformed ? INTERACTIONS_KEY_MALFORMED_ISSUE : INTERACTIONS_UNVERIFIED_ISSUE;
+  ctx.logger.warn(message, { companyId: rt.companyId });
+  if (runtimeHealth.status !== "ok") return;
+  degradeHealth(message, issue, { companyId: rt.companyId });
+}
+
+/**
+ * The webhook interaction gate: true only when this delivery carries a genuine
+ * Discord Ed25519 signature over its own raw body.
+ *
+ * The Paperclip host does not authenticate `POST /api/plugins/:pluginId/
+ * webhooks/:endpointKey` — its own route comment says signature verification is
+ * the plugin's job — so a caller who can reach the URL can write any
+ * `member.user.id` into the body. Everything downstream trusts that field, so
+ * nothing downstream may run until this returns true.
+ *
+ * On a refusal the caller acts on nothing and returns no interaction response.
+ * Discord's own rule (HTTP 401 for a bad signature) cannot be honoured here:
+ * this host always answers 200 with its own JSON envelope. See the result note.
+ *
+ * Logs at warn, at most once per cause per window, carrying no signature
+ * material, no key, and no secret. A malformed key is refused exactly as no key
+ * is: it can verify nothing.
+ */
+function verifyInteractionDelivery(
+  ctx: PluginContext | null,
+  rt: DiscordRuntime | null,
+  input: PluginWebhookInput,
+): boolean {
+  const publicKey = rt?.discordPublicKey ?? null;
+
+  if (!publicKey) {
+    // Distinct from a bad signature: this is a configuration gap. A malformed
+    // key already raised its own note at bootstrap, so only the unset case is
+    // reported from here — and it is remembered, because the note would not
+    // otherwise survive the next reconnect.
+    const malformed = rt?.discordPublicKeyMalformed === true;
+    const issue = malformed ? INTERACTIONS_KEY_MALFORMED_ISSUE : INTERACTIONS_UNVERIFIED_ISSUE;
+    const message = malformed ? INTERACTIONS_MALFORMED_MESSAGE : INTERACTIONS_UNSET_MESSAGE;
+    const first = !interactionsUnverifiedSeen;
+    interactionsUnverifiedSeen = true;
+    if (allowInteractionRefusalLog(issue)) {
+      ctx?.logger.warn(message, { endpointKey: input.endpointKey });
+    }
+    // At most one degradation per cause per configuration delivery, and never
+    // over an unrelated note: an anonymous caller must not be able to choose
+    // what plugin health says, nor to mask a real failure by repeating a request.
+    if (first && runtimeHealth.status === "ok") {
+      degradeHealth(message, issue, { companyId: rt?.companyId ?? null });
+    }
+    return false;
+  }
+
+  if (verifyDiscordWebhookSignature(input, publicKey)) return true;
+
+  if (allowInteractionRefusalLog("discord-interactions-bad-signature")) {
+    ctx?.logger.warn(
+      "Discord interaction refused: its Ed25519 signature did not verify against the configured " +
+        "application public key, or its signed timestamp is outside the replay window",
+      {
+        endpointKey: input.endpointKey,
+        requestId: input.requestId,
+        hasSignature: readSignatureHeader(input.headers, SIGNATURE_HEADER) !== null,
+        hasTimestamp: readSignatureHeader(input.headers, TIMESTAMP_HEADER) !== null,
+        rawBodyBytes: typeof input.rawBody === "string" ? input.rawBody.length : 0,
+      },
+    );
+  }
+  return false;
 }
 
 async function resolveChannel(
@@ -2320,6 +2492,15 @@ async function bootstrapRuntime(
   rt.voiceEnabled = voiceEnabled;
   rt.voice = rt.voice ?? null;
   rt.hannaDiscordUserId = normalizeDiscordId(config.hannaDiscordUserId);
+  // Three cases, not two. UNSET raises nothing here: most installs take the
+  // gateway path, which needs no public key, so a bootstrap warning would be
+  // false noise, and that note waits for a delivery that actually got dropped.
+  // MALFORMED is wrong on every install, so `applyInteractionsHealth` below
+  // reports it at bootstrap — otherwise a mis-pasted key looks exactly like an
+  // attack and the operator gets no pointer back to their own configuration.
+  // Either way nothing unusable reaches the gate.
+  rt.discordPublicKey = normalizeDiscordPublicKey(config.discordPublicKey);
+  rt.discordPublicKeyMalformed = classifyDiscordPublicKey(config.discordPublicKey) === "malformed";
   rt.accomplishmentsChannelId = normalizeDiscordId(config.accomplishmentsChannelId);
   rt.milestonesChannelId = normalizeDiscordId(config.milestonesChannelId);
   if (rt.accomplishmentsChannelId && (config.agentBots ?? []).length === 0) {
@@ -2430,6 +2611,10 @@ async function bootstrapRuntime(
   // Reapplied every delivery, same as voice's own note below: a configuration
   // save is not evidence that an operator is now configured.
   applyInboundAllowlistHealth(ctx, rt);
+  // Same reason: the reset above cleared a note that a save did not fix. A
+  // malformed key is still malformed, and a webhook delivery that is being
+  // dropped is still being dropped.
+  applyInteractionsHealth(ctx, rt);
 
   await startVoiceIfConfigured(ctx, rt, voiceEnv);
   // The reset above cleared health wholesale. Voice's own notes are not the
@@ -3752,14 +3937,34 @@ const plugin = definePlugin({
 
   async onWebhook(input: PluginWebhookInput): Promise<void> {
     if (input.endpointKey === WEBHOOK_KEYS.discordInteractions) {
-      const body = input.parsedBody as Record<string, unknown>;
-      if (!body) return;
-
       const ctx = _pluginCtx;
       // An interaction carries no company scope, so this consumes whatever
       // runtime a configuration delivery has already established, if any.
       const rt = await ensureRuntime(ctx);
       const cmdCtx = rt?.cmdCtx ?? null;
+
+      // Prove Discord sent this BEFORE anything else looks at it. The host route
+      // is unauthenticated by design, and everything downstream — the author
+      // allowlist most of all — reads caller-supplied fields. Resolving the
+      // runtime above is only how the configured public key is reached; nothing
+      // has acted on the body yet.
+      if (!verifyInteractionDelivery(ctx, rt, input)) return;
+
+      // Act on the bytes that were verified, never on the host's parse of them.
+      // The signature covers `rawBody`; `parsedBody` is a second representation
+      // produced by the host's body parser, which honours a `charset` the signer
+      // never declared — so a delivery could verify as one object and parse as
+      // another. Parsing here keeps the verified bytes and the acted-on object
+      // the same thing. An interaction is always a JSON object: anything else,
+      // including an array or a bare value, is refused.
+      let body: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(input.rawBody as string) as unknown;
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return;
+        body = parsed as Record<string, unknown>;
+      } catch {
+        return;
+      }
 
       if (!ctx || !cmdCtx) {
         // Return a valid Discord interaction response even before setup completes.
@@ -3802,6 +4007,22 @@ const plugin = definePlugin({
       !config.defaultChannelId.trim()
     ) {
       return { ok: false, errors: [`[${PLUGIN_ID}] defaultChannelId is required`] };
+    }
+    // Not required: a gateway-only install needs no public key, so unset stays
+    // acceptable. But a key that IS set and cannot verify anything is refused at
+    // save time rather than at 3am, because the shapes that get through — a
+    // truncation, a placeholder, an all-zero paste — are exactly the ones Ed25519
+    // accepts as a valid point and would turn this gate into accept-all.
+    if (classifyDiscordPublicKey(config.discordPublicKey) === "malformed") {
+      return {
+        ok: false,
+        errors: [
+          `[${PLUGIN_ID}] discordPublicKey must be exactly 64 hexadecimal characters, copied from ` +
+            "your Discord application's General Information page, and must not be one of Ed25519's " +
+            "low-order encodings. Leave it empty if this install receives interactions over the " +
+            "Discord gateway instead",
+        ],
+      };
     }
     return { ok: true };
   },

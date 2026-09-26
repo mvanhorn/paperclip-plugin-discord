@@ -50,6 +50,10 @@ export const DEFAULT_CONFIG = {
   approvalsChannels: {} as Record<string, string>,
   agentBots: [] as Array<{ agentId: string; botTokenRef: unknown; channelId: string }>,
   hannaDiscordUserId: "",
+  // The Discord application's public key. Public, not a secret. Unset, every
+  // webhook-delivered interaction is dropped unverified — see
+  // src/interaction-signature.ts.
+  discordPublicKey: "",
   accomplishmentsChannelId: "",
   milestonesChannelId: "",
   // Local Whisper (whisper.cpp) config for voice transcription. Defaults match
