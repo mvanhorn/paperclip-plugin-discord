@@ -801,9 +801,9 @@ const BOARD_ASSIGNEE = "local-board";
 /**
  * Outbound trigger 1 from the spec's "Message flow": an issue moves to
  * `in_review` or `blocked`, assigned to `local-board`. The assignee's own bot
- * (falling back to the default bot — see `resolveOutboundBot`) posts the
- * agent's ask and mentions the configured operator. This is the only event
- * that ever posts that mention.
+ * posts the agent's ask and mentions the configured operator. This is the
+ * only event that ever posts that mention. If no agent bot and channel match,
+ * the wake is dropped rather than sent through the default channel.
  *
  * Opt-in: with no `hannaDiscordUserId` configured there is no one to mention,
  * so this never fires — matching upstream, which has no such event at all.
@@ -830,7 +830,15 @@ async function notifyBoardWake(
 
   const agentId = typeof payload.assigneeAgentId === "string" ? payload.assigneeAgentId : null;
   const outboundBot = resolveOutboundBot(rt, agentId);
-  const channelId = await resolveChannel(ctx, event.companyId, outboundBot.channelId ?? rt.defaultChannelId);
+  if (!outboundBot.channelId) {
+    ctx.logger.warn("board-wake: no agent bot/channel resolved, dropping the wake", {
+      issueId: event.entityId,
+      companyId: event.companyId,
+      agentId,
+    });
+    return;
+  }
+  const channelId = await resolveChannel(ctx, event.companyId, outboundBot.channelId);
   if (!channelId) {
     ctx.logger.warn("board-wake: no channel resolved, dropping the wake", {
       issueId: event.entityId,
@@ -838,6 +846,10 @@ async function notifyBoardWake(
     });
     return;
   }
+
+  const scope = { scopeKind: "instance" as const, stateKey };
+  // Claim before the post, so a concurrent handler for the same wake skips.
+  await ctx.state.set(scope, marker);
 
   const askText = String(payload.lastComment ?? payload.title ?? "").trim();
   const truncatedAsk =
@@ -854,10 +866,10 @@ async function notifyBoardWake(
       companyId: event.companyId,
       status,
     });
+    await releaseClaim(ctx, scope, previousMarker);
     return;
   }
 
-  await ctx.state.set({ scopeKind: "instance", stateKey }, marker);
   if (rt.config.enableInbound !== false) {
     // So a reply to this exact message routes back to the issue, same as any
     // other notification (see `notify()` and `resolveInboundDestination`).

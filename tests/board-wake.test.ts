@@ -70,6 +70,9 @@ function buildHost() {
       set: vi.fn(async (key: any, value: unknown) => {
         stateStore.set(`${key.scopeKind}:${key.scopeId ?? ""}:${key.stateKey}`, value);
       }),
+      delete: vi.fn(async (key: any) => {
+        stateStore.delete(`${key.scopeKind}:${key.scopeId ?? ""}:${key.stateKey}`);
+      }),
     },
     metrics: { write: vi.fn() },
     activity: { log: vi.fn() },
@@ -130,6 +133,20 @@ function baseConfig(overrides: Record<string, unknown> = {}) {
     enableCommands: false,
     digestMode: "off",
     notifyOnIssueDone: false,
+    ...overrides,
+  };
+}
+
+function mappedBoardWakeConfig(overrides: Record<string, unknown> = {}) {
+  return {
+    hannaDiscordUserId: HANNA_ID,
+    agentBots: [
+      {
+        agentId: "agent-coda",
+        botTokenRef: { type: "secret_ref", secretId: CODA_SECRET_ID },
+        channelId: "chan-coda",
+      },
+    ],
     ...overrides,
   };
 }
@@ -206,13 +223,14 @@ describe("board wake — the mention and the message", () => {
   it("posts the ask, mentions Hanna, and links the issue for in_review/local-board", async () => {
     const host = buildHost();
     await definition().setup(host.ctx);
-    await host.deliver({ hannaDiscordUserId: HANNA_ID, paperclipBaseUrl: "https://paperclip.test" });
+    await host.deliver(mappedBoardWakeConfig({ paperclipBaseUrl: "https://paperclip.test" }));
 
     host.ctx.issues.get.mockResolvedValue({
       identifier: "SAG-1",
       title: "Need a decision",
       status: "in_review",
       assigneeUserId: "local-board",
+      assigneeAgentId: "agent-coda",
       updatedAt: "2026-09-26T01:00:00.000Z",
     });
     host.ctx.issues.listComments.mockResolvedValue([
@@ -232,13 +250,14 @@ describe("board wake — the mention and the message", () => {
   it("fires for blocked too", async () => {
     const host = buildHost();
     await definition().setup(host.ctx);
-    await host.deliver({ hannaDiscordUserId: HANNA_ID });
+    await host.deliver(mappedBoardWakeConfig());
 
     host.ctx.issues.get.mockResolvedValue({
       identifier: "SAG-2",
       title: "Stuck",
       status: "blocked",
       assigneeUserId: "local-board",
+      assigneeAgentId: "agent-coda",
       updatedAt: "2026-09-26T01:00:00.000Z",
     });
 
@@ -250,7 +269,7 @@ describe("board wake — the mention and the message", () => {
   it("logs when no channel resolves for the wake (silent-failure review B3)", async () => {
     const host = buildHost();
     await definition().setup(host.ctx);
-    await host.deliver({ hannaDiscordUserId: HANNA_ID });
+    await host.deliver(mappedBoardWakeConfig());
 
     // The per-company `/clip connect-channel` override (resolveChannel's
     // first, highest-priority source) is checked ahead of defaultChannelId —
@@ -264,6 +283,7 @@ describe("board wake — the mention and the message", () => {
       title: "No channel",
       status: "in_review",
       assigneeUserId: "local-board",
+      assigneeAgentId: "agent-coda",
       updatedAt: "2026-09-26T01:00:00.000Z",
     });
 
@@ -279,17 +299,18 @@ describe("board wake — the mention and the message", () => {
   it("logs when Discord refuses the wake post (silent-failure review B4)", async () => {
     const host = buildHost();
     await definition().setup(host.ctx);
-    await host.deliver({ hannaDiscordUserId: HANNA_ID });
+    await host.deliver(mappedBoardWakeConfig());
 
     host.ctx.issues.get.mockResolvedValue({
       identifier: "SAG-4",
       title: "Refused",
       status: "blocked",
       assigneeUserId: "local-board",
+      assigneeAgentId: "agent-coda",
       updatedAt: "2026-09-26T01:00:00.000Z",
     });
 
-    httpFetchMock.mockImplementation(async () => ({
+    httpFetchMock.mockImplementationOnce(async () => ({
       ok: false,
       status: 403,
       headers: new Headers(),
@@ -303,12 +324,15 @@ describe("board wake — the mention and the message", () => {
       expect.stringContaining("failed to post"),
       expect.objectContaining({ issueId: "issue-4", companyId: COMPANY_A, status: "blocked" }),
     );
+
+    await host.issueUpdated({ status: "blocked", assigneeUserId: "local-board" }, COMPANY_A, "issue-4");
+    expect(postedMessages()).toHaveLength(2);
   });
 
   it("truncates a long ask to 1,900 characters and still includes the issue link", async () => {
     const host = buildHost();
     await definition().setup(host.ctx);
-    await host.deliver({ hannaDiscordUserId: HANNA_ID, paperclipBaseUrl: "https://paperclip.test" });
+    await host.deliver(mappedBoardWakeConfig({ paperclipBaseUrl: "https://paperclip.test" }));
 
     const longAsk = "x".repeat(2500);
     host.ctx.issues.get.mockResolvedValue({
@@ -316,6 +340,7 @@ describe("board wake — the mention and the message", () => {
       title: "Long ask",
       status: "in_review",
       assigneeUserId: "local-board",
+      assigneeAgentId: "agent-coda",
       updatedAt: "2026-09-26T01:00:00.000Z",
     });
     host.ctx.issues.listComments.mockResolvedValue([
@@ -355,7 +380,7 @@ describe("board wake — the mention and the message", () => {
     expect(init.headers.Authorization).toBe("Bot coda-bot-token");
   });
 
-  it("falls back to the default bot and channel with no agent bot match", async () => {
+  it("does not post a mention to the default channel with no agent bot match", async () => {
     const host = buildHost();
     await definition().setup(host.ctx);
     await host.deliver({ hannaDiscordUserId: HANNA_ID, defaultChannelId: "chan-default" });
@@ -371,9 +396,11 @@ describe("board wake — the mention and the message", () => {
 
     await host.issueUpdated({ status: "in_review", assigneeUserId: "local-board", assigneeAgentId: "agent-unmapped" });
 
-    const [url, init] = postedMessages()[0];
-    expect(String(url)).toContain("/channels/chan-default/messages");
-    expect(init.headers.Authorization).toBe("Bot main-bot-token");
+    expect(postedMessages()).toHaveLength(0);
+    expect(host.ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("no agent bot/channel"),
+      expect.objectContaining({ issueId: "issue-1", companyId: COMPANY_A }),
+    );
   });
 
   it("routes a listed worker's issue through its lead's bot and channel (alsoForAgentIds)", async () => {
@@ -407,7 +434,7 @@ describe("board wake — the mention and the message", () => {
     expect(init.headers.Authorization).toBe("Bot coda-bot-token");
   });
 
-  it("falls back to the default bot for an agent id not listed as a lead or a worker", async () => {
+  it("does not post for an agent id not listed as a lead or a worker", async () => {
     const host = buildHost();
     await definition().setup(host.ctx);
     await host.deliver({
@@ -434,27 +461,78 @@ describe("board wake — the mention and the message", () => {
 
     await host.issueUpdated({ status: "in_review", assigneeUserId: "local-board", assigneeAgentId: "agent-stranger" });
 
-    const [url, init] = postedMessages()[0];
-    expect(String(url)).toContain("/channels/chan-default/messages");
-    expect(init.headers.Authorization).toBe("Bot main-bot-token");
+    expect(postedMessages()).toHaveLength(0);
+    expect(host.ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("no agent bot/channel"),
+      expect.objectContaining({ issueId: "issue-1", companyId: COMPANY_A }),
+    );
   });
 
   it("does not repost for a redelivery of the same status and updatedAt", async () => {
     const host = buildHost();
     await definition().setup(host.ctx);
-    await host.deliver({ hannaDiscordUserId: HANNA_ID });
+    await host.deliver(mappedBoardWakeConfig());
 
     host.ctx.issues.get.mockResolvedValue({
       identifier: "SAG-6",
       title: "Dup check",
       status: "in_review",
       assigneeUserId: "local-board",
+      assigneeAgentId: "agent-coda",
       updatedAt: "2026-09-26T01:00:00.000Z",
     });
 
     await host.issueUpdated({ status: "in_review", assigneeUserId: "local-board" }, COMPANY_A, "issue-dup");
     await host.issueUpdated({ status: "in_review", assigneeUserId: "local-board" }, COMPANY_A, "issue-dup");
 
+    expect(postedMessages()).toHaveLength(1);
+  });
+
+  it("claims the marker before posting so concurrent deliveries produce one message", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(mappedBoardWakeConfig());
+
+    host.ctx.issues.get.mockResolvedValue({
+      identifier: "SAG-8",
+      title: "Concurrent wake",
+      status: "in_review",
+      assigneeUserId: "local-board",
+      assigneeAgentId: "agent-coda",
+      updatedAt: "2026-09-26T01:00:00.000Z",
+    });
+
+    let releaseFirstPost!: () => void;
+    httpFetchMock.mockImplementationOnce(
+      async () =>
+        new Promise((resolve) => {
+          releaseFirstPost = () =>
+            resolve({
+              ok: true,
+              status: 200,
+              headers: new Headers(),
+              json: async () => ({ id: "posted-msg-1" }),
+              text: async () => "",
+            });
+        }),
+    );
+
+    const first = host.issueUpdated(
+      { status: "in_review", assigneeUserId: "local-board", assigneeAgentId: "agent-coda" },
+      COMPANY_A,
+      "issue-race",
+    );
+    await vi.waitFor(() => expect(postedMessages()).toHaveLength(1));
+    const second = host.issueUpdated(
+      { status: "in_review", assigneeUserId: "local-board", assigneeAgentId: "agent-coda" },
+      COMPANY_A,
+      "issue-race",
+    );
+    await second;
+    expect(postedMessages()).toHaveLength(1);
+
+    releaseFirstPost();
+    await first;
     expect(postedMessages()).toHaveLength(1);
   });
 });
