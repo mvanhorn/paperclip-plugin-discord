@@ -40,6 +40,7 @@ import {
   initiateHandoff,
   startDiscussion,
 } from "./session-registry.js";
+import { AsyncResource } from "node:async_hooks";
 import { DiscordAdapter } from "./adapter.js";
 import { processMediaMessage, type MediaAttachment } from "./media-pipeline.js";
 import { registerCommand, parseCommandMessage, executeCommand, listCommands } from "./custom-commands.js";
@@ -269,6 +270,15 @@ type DiscordRuntime = {
 
 /** Captured in setup() so onWebhook / onConfigChanged can reach the host APIs. */
 let _pluginCtx: PluginContext | null = null;
+// Captured at module load, outside any host invocation. The gateway socket is
+// opened from inside the host's `configChanged` call, and every callback the
+// socket schedules would otherwise inherit that call's invocation id. The host
+// retires that id once the call settles, so later slash commands and messages
+// would echo a dead id and be denied ("missing, expired, or unknown invocation
+// scope"). Opening the socket in this root context makes gateway-driven calls
+// genuinely proactive, which the host admits for configured companies.
+const rootAsyncScope = new AsyncResource("discord-gateway-root");
+
 let runtime: DiscordRuntime | null = null;
 let runtimeHealth: DiscordRuntimeHealth = {
   status: "degraded",
@@ -1345,7 +1355,7 @@ async function bootstrapRuntime(
 
   if (!reuseGateway) {
     try {
-      rt.gateway = await connectGateway(
+      rt.gateway = await rootAsyncScope.runInAsyncScope(() => connectGateway(
         ctx,
         token,
         // Every callback reads the CURRENT runtime rather than closing over the
@@ -1385,7 +1395,7 @@ async function bootstrapRuntime(
             runtimeHealth = { status: "degraded", message, details };
           },
         },
-      );
+      ));
     } catch (err) {
       const error = summarizeError(err, [token]);
       rt.gatewayFailed = true;

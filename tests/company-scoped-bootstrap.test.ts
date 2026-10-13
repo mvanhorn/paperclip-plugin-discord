@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // ---------------------------------------------------------------------------
@@ -39,6 +40,8 @@ type GatewayConnect = {
   onMessage?: (message: any) => Promise<void> | void;
   options: any;
   closed: boolean;
+  /** The simulated host invocation visible to the gateway when it connected. */
+  invocationAtConnect: unknown;
 };
 
 const { gatewayConnects, gatewayCloses } = vi.hoisted(() => ({
@@ -54,7 +57,14 @@ vi.mock("../src/gateway.js", () => ({
     onMessage: any,
     options: any,
   ) => {
-    const record: GatewayConnect = { token, onInteraction, onMessage, options, closed: false };
+    const record: GatewayConnect = {
+      token,
+      onInteraction,
+      onMessage,
+      options,
+      closed: false,
+      invocationAtConnect: invocationStore.getStore(),
+    };
     gatewayConnects.push(record);
     return {
       close: () => {
@@ -66,6 +76,11 @@ vi.mock("../src/gateway.js", () => ({
 }));
 
 import { _resetRuntimeForTests, _getRuntimeForTests } from "../src/worker.js";
+
+// Stands in for the SDK's invocation context: the SDK runs each host call
+// inside an AsyncLocalStorage store and stamps every worker→host request made
+// within it with that invocation's id.
+const invocationStore = new AsyncLocalStorage<{ id: string }>();
 import { _resetCompanyIdCache } from "../src/company-resolver.js";
 
 const COMPANY_A = "11111111-1111-1111-1111-111111111111";
@@ -643,6 +658,23 @@ describe("host matrix: >= 2026.817.0 (host replays stored configuration)", () =>
   });
 });
 
+
+describe("gateway invocation context", () => {
+  it("opens the gateway outside the configChanged invocation that started it", async () => {
+    // The host retires a call's invocation once the call settles. A gateway
+    // opened inside configChanged would hand that id to every callback it
+    // schedules, and the host would deny each later call as an expired scope.
+    const host = buildHost();
+    await definition().setup(host.ctx);
+
+    await invocationStore.run({ id: "config-changed-call" }, () =>
+      host.deliver(COMPANY_A, storedConfig()),
+    );
+
+    expect(gatewayConnects).toHaveLength(1);
+    expect(gatewayConnects[0].invocationAtConnect).toBeUndefined();
+  });
+});
 
 describe("re-bootstrap on configuration changes", () => {
   it("keeps the live gateway when the same company saves an unchanged token", async () => {

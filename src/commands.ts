@@ -368,7 +368,7 @@ async function handleSlashCommand(
 ): Promise<unknown> {
   // Lazy company-ID resolution: resolve on first command, not at startup.
   const companyId = cmdCtx?.pluginCtx
-    ? await resolveCompanyId(cmdCtx.pluginCtx)
+    ? await resolveCompanyId(cmdCtx.pluginCtx, cmdCtx.companyId)
     : (cmdCtx?.companyId ?? "default");
 
   if (data.name === "acp") {
@@ -484,7 +484,7 @@ async function handleAutocomplete(
 
     if (focusedOption.name === "project") {
       const companyId = cmdCtx?.pluginCtx
-        ? await resolveCompanyId(cmdCtx.pluginCtx)
+        ? await resolveCompanyId(cmdCtx.pluginCtx, cmdCtx.companyId)
         : (cmdCtx?.companyId ?? "default");
       const projects = await ctx.projects.list({ companyId, limit: 100 });
       const filtered = projects
@@ -1539,7 +1539,7 @@ async function handleCommands(
     });
   }
 
-  const companyId = await resolveCompanyId(ctx);
+  const companyId = await resolveCompanyId(ctx, cmdCtx?.companyId);
   const baseUrl = cmdCtx?.baseUrl ?? "http://localhost:3100";
   const token = cmdCtx?.token ?? "";
   const channelId = cmdCtx?.defaultChannelId ?? "";
@@ -1815,7 +1815,7 @@ async function handleWorkflowApprovalButton(
 ): Promise<unknown> {
   const approved = customId.startsWith("wf_approve_");
   const approvalId = customId.replace(/^wf_(approve|reject)_/, "");
-  const companyId = await resolveCompanyId(ctx);
+  const companyId = await resolveCompanyId(ctx, cmdCtx?.companyId);
   const baseUrl = cmdCtx?.baseUrl ?? "http://localhost:3100";
   const token = cmdCtx?.token ?? "";
   const channelId = cmdCtx?.defaultChannelId ?? "";

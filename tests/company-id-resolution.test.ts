@@ -268,6 +268,50 @@ describe("lazy company-ID resolution", () => {
     expect(result).toBe("default");
   });
 
+  it("resolveCompanyId prefers the owner company over companies.list", async () => {
+    const ownerId = "9fb37ce4-83a9-45f7-8dde-372e77247736";
+    const ctx = makeCtx();
+    const result = await resolveCompanyId(ctx as any, ownerId);
+    expect(result).toBe(ownerId);
+    expect(ctx.companies.list).not.toHaveBeenCalled();
+  });
+
+  it("resolveCompanyId lets a /clip connect default win over the owner company", async () => {
+    const ctx = makeCtx({
+      state: {
+        get: vi.fn().mockResolvedValue({ companyId: REAL_COMPANY_ID }),
+        set: vi.fn().mockResolvedValue(undefined),
+      },
+    });
+    const result = await resolveCompanyId(ctx as any, "9fb37ce4-83a9-45f7-8dde-372e77247736");
+    expect(result).toBe(REAL_COMPANY_ID);
+  });
+
+  it("resolveCompanyId ignores a 'default' owner and falls back to companies.list", async () => {
+    const ctx = makeCtx();
+    const result = await resolveCompanyId(ctx as any, "default");
+    expect(result).toBe(REAL_COMPANY_ID);
+    expect(ctx.companies.list).toHaveBeenCalledTimes(1);
+  });
+
+  it("slash commands use the owner company when the host denies companies.list", async () => {
+    // Outside a host invocation, the host denies `companies.list` whenever
+    // another scoped invocation is active (INVOCATION_SCOPE_DENIED).
+    const ctx = makeCtx({
+      companies: {
+        list: vi.fn().mockRejectedValue(
+          new Error('Plugin "p" is not allowed to perform "companies.list": the worker referenced a missing, expired, or unknown invocation scope'),
+        ),
+      },
+    });
+    const cmdCtx = makeCmdCtx({ pluginCtx: ctx as any });
+
+    await handleInteraction(ctx, agentsInteraction() as any, cmdCtx);
+
+    expect(ctx.companies.list).not.toHaveBeenCalled();
+    expect(ctx.agents.list.mock.calls[0][0].companyId).toBe(REAL_COMPANY_ID);
+  });
+
   it("handleInteraction uses lazy resolver when pluginCtx is set", async () => {
     _resetCompanyIdCache();
     const ctx = makeCtx();

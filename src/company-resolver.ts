@@ -11,7 +11,7 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
  */
 let _cachedCompanyId: string | null = null;
 
-export async function resolveCompanyId(ctx: PluginContext): Promise<string> {
+export async function resolveCompanyId(ctx: PluginContext, ownerCompanyId?: string): Promise<string> {
   // Check if a guild-level default was set via /clip connect — always re-read
   // so that switching companies works without a plugin restart.
   try {
@@ -22,6 +22,11 @@ export async function resolveCompanyId(ctx: PluginContext): Promise<string> {
   } catch {
     // state API unavailable at this call site — fall through to list-based resolution
   }
+
+  // The company that owns this install. Gateway-driven calls run outside any
+  // host invocation, where `companies.list` is denied whenever another scoped
+  // invocation is active, so prefer the known owner over listing.
+  if (ownerCompanyId && ownerCompanyId !== "default") return ownerCompanyId;
 
   if (_cachedCompanyId) return _cachedCompanyId;
   try {
