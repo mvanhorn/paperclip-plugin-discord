@@ -136,6 +136,10 @@ function sessionsKey(threadId: string): string {
   return `sessions_${threadId}`;
 }
 
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 export async function getThreadSessions(
   ctx: PluginContext,
   threadId: string,
@@ -251,7 +255,20 @@ export async function spawnAgentInThread(
   taskPrompt: string,
   maxAgents: number = MAX_AGENTS_PER_THREAD,
 ): Promise<{ ok: boolean; sessionId?: string; transport?: TransportKind; error?: string }> {
-  const sessions = await getThreadSessions(ctx, threadId, companyId);
+  let sessions: AgentSessionEntry[];
+  try {
+    sessions = await getThreadSessions(ctx, threadId, companyId);
+  } catch (err) {
+    ctx.logger.error("Refusing to spawn: the thread's agent sessions could not be read", {
+      threadId,
+      agentName,
+      error: errorText(err),
+    });
+    return {
+      ok: false,
+      error: `Could not read this thread's agent sessions, so **${agentName}** was not started — one may already be running. Try again shortly.`,
+    };
+  }
   const running = sessions.filter((s) => s.status === "running");
 
   if (running.length >= maxAgents) {
@@ -367,7 +384,20 @@ export async function closeAgentInThread(
   agentName: string,
   companyId: string,
 ): Promise<{ ok: boolean; error?: string }> {
-  const sessions = await getThreadSessions(ctx, threadId, companyId);
+  let sessions: AgentSessionEntry[];
+  try {
+    sessions = await getThreadSessions(ctx, threadId, companyId);
+  } catch (err) {
+    ctx.logger.error("Refusing to close: the thread's agent sessions could not be read", {
+      threadId,
+      agentName,
+      error: errorText(err),
+    });
+    return {
+      ok: false,
+      error: `Could not read this thread's agent sessions, so **${agentName}** was left alone. Try again shortly.`,
+    };
+  }
   const target = sessions.find(
     (s) => s.agentName.toLowerCase() === agentName.toLowerCase() && s.status === "running",
   );
@@ -448,7 +478,16 @@ export async function routeMessageToAgent(
   companyId: string,
   replyToSessionId?: string,
 ): Promise<boolean> {
-  const sessions = await getThreadSessions(ctx, threadId, companyId);
+  let sessions: AgentSessionEntry[];
+  try {
+    sessions = await getThreadSessions(ctx, threadId, companyId);
+  } catch (err) {
+    ctx.logger.error("Not routing the message: the thread's agent sessions could not be read", {
+      threadId,
+      error: errorText(err),
+    });
+    return false;
+  }
   const running = sessions.filter((s) => s.status === "running");
   if (running.length === 0) return false;
 
@@ -472,14 +511,21 @@ export async function routeMessageToAgent(
   if (!target) return false;
 
   // Check for active discussion checkpoint
-  const discussionId = await findActiveDiscussion(ctx, threadId, companyId);
-  if (discussionId) {
-    const discussion = await getDiscussion(ctx, discussionId, companyId);
-    if (discussion && discussion.status === "paused_checkpoint") {
-      discussion.status = "active";
-      discussion.lastActivityAt = new Date().toISOString();
-      await saveDiscussion(ctx, discussion);
+  try {
+    const discussionId = await findActiveDiscussion(ctx, threadId, companyId);
+    if (discussionId) {
+      const discussion = await getDiscussion(ctx, discussionId, companyId);
+      if (discussion && discussion.status === "paused_checkpoint") {
+        discussion.status = "active";
+        discussion.lastActivityAt = new Date().toISOString();
+        await saveDiscussion(ctx, discussion);
+      }
     }
+  } catch (err) {
+    ctx.logger.error("Could not resume a paused discussion: its state was unreadable", {
+      threadId,
+      error: errorText(err),
+    });
   }
 
   // Update last activity
@@ -539,35 +585,53 @@ export async function handleAcpOutput(
   const { sessionId, threadId, agentName, output, status } = event;
   const eventCompanyId = event.companyId || "default";
 
-  let sessions = await getThreadSessions(ctx, threadId, eventCompanyId);
-  let session = sessions.find((s) => s.sessionId === sessionId);
-
-  if (!session) {
-    const now = new Date().toISOString();
-    session = {
+  // An unreadable session list must not be overwritten with a list built from
+  // nothing; the output is still relayed, without session bookkeeping.
+  let sessions: AgentSessionEntry[] | null = null;
+  try {
+    sessions = await getThreadSessions(ctx, threadId, eventCompanyId);
+  } catch (err) {
+    ctx.logger.error("Relaying ACP output without session bookkeeping: the session list was unreadable", {
+      threadId,
       sessionId,
-      agentId: "",
-      agentName,
-      agentDisplayName: agentName,
-      companyId: eventCompanyId,
-      transport: "acp",
-      spawnedAt: now,
-      status: "running",
-      lastActivityAt: now,
-    };
-    sessions.push(session);
+      error: errorText(err),
+    });
   }
 
-  if (status && status !== session.status) {
-    session.status = status;
+  let displayName = agentName;
+  let multiAgent = false;
+
+  if (sessions) {
+    let session = sessions.find((s) => s.sessionId === sessionId);
+
+    if (!session) {
+      const now = new Date().toISOString();
+      session = {
+        sessionId,
+        agentId: "",
+        agentName,
+        agentDisplayName: agentName,
+        companyId: eventCompanyId,
+        transport: "acp",
+        spawnedAt: now,
+        status: "running",
+        lastActivityAt: now,
+      };
+      sessions.push(session);
+    }
+
+    if (status && status !== session.status) {
+      session.status = status;
+    }
+    session.lastActivityAt = new Date().toISOString();
+    await saveThreadSessions(ctx, threadId, sessions, eventCompanyId);
+
+    displayName = session.agentDisplayName;
+    multiAgent =
+      sessions.filter((s) => s.status === "running" || s.sessionId === sessionId).length > 1;
   }
-  session.lastActivityAt = new Date().toISOString();
-  await saveThreadSessions(ctx, threadId, sessions, eventCompanyId);
 
-  const multiAgent =
-    sessions.filter((s) => s.status === "running" || s.sessionId === sessionId).length > 1;
-
-  enqueueOutput(threadId, session.agentDisplayName, output);
+  enqueueOutput(threadId, displayName, output);
 
   if (status === "completed" || status === "failed") {
     await postEmbed(ctx, token, threadId, {
@@ -583,9 +647,16 @@ export async function handleAcpOutput(
     });
   }
 
-  const discussionId = await findActiveDiscussion(ctx, threadId, eventCompanyId);
-  if (discussionId) {
-    await advanceDiscussion(ctx, token, threadId, discussionId, agentName);
+  try {
+    const discussionId = await findActiveDiscussion(ctx, threadId, eventCompanyId);
+    if (discussionId) {
+      await advanceDiscussion(ctx, token, threadId, discussionId, agentName);
+    }
+  } catch (err) {
+    ctx.logger.error("Could not advance the thread's discussion: its state was unreadable", {
+      threadId,
+      error: errorText(err),
+    });
   }
 
   scheduleFlush(ctx, token, threadId, multiAgent);
@@ -763,7 +834,17 @@ export async function handleHandoffButton(
   const handoffId = parts.slice(2).join("_");
 
   // No companyId available yet — fallback read will check "default" scope
-  const record = await getHandoff(ctx, handoffId);
+  let record: HandoffRecord | null;
+  try {
+    record = await getHandoff(ctx, handoffId);
+  } catch (err) {
+    ctx.logger.error("Handoff record could not be read", { handoffId, error: errorText(err) });
+    return respondToInteraction({
+      type: 4,
+      content: `Could not read handoff \`${handoffId}\` right now. Nothing was changed — try again shortly.`,
+      ephemeral: true,
+    });
+  }
   if (!record) {
     return respondToInteraction({ type: 4, content: `Handoff \`${handoffId}\` not found.`, ephemeral: true });
   }
@@ -1009,7 +1090,17 @@ export async function handleDiscussionButton(
   const action = parts[1];
   const discussionId = parts.slice(2).join("_");
 
-  const discussion = await getDiscussion(ctx, discussionId);
+  let discussion: DiscussionLoop | null;
+  try {
+    discussion = await getDiscussion(ctx, discussionId);
+  } catch (err) {
+    ctx.logger.error("Discussion record could not be read", { discussionId, error: errorText(err) });
+    return respondToInteraction({
+      type: 4,
+      content: `Could not read discussion \`${discussionId}\` right now. Nothing was changed — try again shortly.`,
+      ephemeral: true,
+    });
+  }
   if (!discussion) {
     return respondToInteraction({ type: 4, content: `Discussion \`${discussionId}\` not found.`, ephemeral: true });
   }

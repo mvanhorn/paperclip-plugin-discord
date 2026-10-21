@@ -67,6 +67,7 @@ vi.mock("../src/gateway.js", () => ({
 
 import { _resetRuntimeForTests, _getRuntimeForTests } from "../src/worker.js";
 import { _resetCompanyIdCache } from "../src/company-resolver.js";
+import { _resetCompanyPrefixCache } from "../src/company-prefix.js";
 
 const COMPANY_A = "11111111-1111-1111-1111-111111111111";
 const COMPANY_B = "22222222-2222-2222-2222-222222222222";
@@ -140,6 +141,8 @@ function buildHost(options: HostOptions = {}) {
   let invocationScope: string | null = null;
   let secretResolutionGate: Promise<void> | null = null;
   let releaseGate: () => void = () => {};
+  let companyGetGate: Promise<void> | null = null;
+  let releaseCompanyGetGate: () => void = () => {};
 
   const ctx = {
     config: {
@@ -210,6 +213,7 @@ function buildHost(options: HostOptions = {}) {
       }),
       // Scope-gated single-company read, used for the deep-link issue prefix.
       get: vi.fn(async (companyId: string) => {
+        if (companyGetGate) await companyGetGate;
         if (enforceInvocationScope && companyId !== invocationScope) {
           throw new Error(
             `requested company "${companyId}" but the current invocation is scoped to company "${invocationScope}"`,
@@ -276,6 +280,14 @@ function buildHost(options: HostOptions = {}) {
       secretResolutionGate = null;
       releaseGate();
     },
+    /** Hold every subsequent issue-prefix lookup until releaseCompanyLookup(). */
+    deferCompanyLookup() {
+      companyGetGate = new Promise<void>((resolve) => { releaseCompanyGetGate = resolve; });
+    },
+    releaseCompanyLookup() {
+      companyGetGate = null;
+      releaseCompanyGetGate();
+    },
     /** Everything the plugin published about itself, for leak assertions. */
     everythingSaid(diagnostics: unknown) {
       return JSON.stringify([
@@ -296,10 +308,20 @@ function definition(): any {
 beforeEach(() => {
   _resetRuntimeForTests();
   _resetCompanyIdCache();
+  _resetCompanyPrefixCache();
   gatewayConnects.length = 0;
   gatewayCloses.count = 0;
   vi.clearAllMocks();
 });
+
+/** Spin the event loop until `predicate` holds, so a parked await can be observed. */
+async function waitUntil(predicate: () => boolean, label: string): Promise<void> {
+  for (let i = 0; i < 500; i++) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
 
 describe("host matrix: pre-2026.720.0 (secret-ref kill switch)", () => {
   it("keeps the worker activated, degrades health, and reports the host's real error", async () => {
@@ -825,6 +847,78 @@ describe("re-bootstrap on configuration changes", () => {
       expect.stringContaining(`this install serves ${COMPANY_A}`),
       expect.objectContaining({ runningCompanyId: COMPANY_A, deliveredCompanyId: COMPANY_B }),
     );
+  });
+});
+
+describe("a bootstrap in flight never exposes a half-updated runtime", () => {
+  const OLD_CHANNEL = "1490608926423646298";
+  const NEW_CHANNEL = "1490610083728588950";
+
+  /** Everything a notification reads off the runtime, as one generation. */
+  function generation() {
+    const rt = _getRuntimeForTests()!;
+    return {
+      token: rt.token,
+      defaultChannelId: rt.defaultChannelId,
+      cmdToken: rt.cmdCtx.token,
+      cmdChannelId: rt.cmdCtx.defaultChannelId,
+    };
+  }
+
+  it("keeps the token and the channel of one save together while the issue prefix resolves", async () => {
+    const host = buildHost();
+    host.ctx.secrets.resolve.mockImplementation(async (ref: unknown) => {
+      if (typeof ref === "string") throw new Error("string refs are rejected by the host");
+      return (ref as any).secretId === SECRET_ID ? "discord-bot-token" : "rotated-token";
+    });
+
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig());
+    expect(generation()).toEqual({
+      token: "discord-bot-token",
+      defaultChannelId: OLD_CHANNEL,
+      cmdToken: "discord-bot-token",
+      cmdChannelId: OLD_CHANNEL,
+    });
+
+    // The prefix lookup is the long await inside bootstrap: an uncached company
+    // whose `companies.get` is slow, or that falls back to the REST API.
+    _resetCompanyPrefixCache();
+    host.ctx.companies.get.mockClear();
+    host.deferCompanyLookup();
+
+    const delivery = host.deliver(
+      COMPANY_A,
+      storedConfig({
+        discordBotTokenRef: { type: "secret_ref", secretId: ROTATED_SECRET_ID },
+        defaultChannelId: NEW_CHANNEL,
+      }),
+    );
+
+    await waitUntil(
+      () => host.ctx.companies.get.mock.calls.length > 0,
+      "the bootstrap to reach the issue-prefix lookup",
+    );
+
+    // Mid-bootstrap, every reader still sees the previous save in full. Sending
+    // the new token to the old channel, or the reverse, is the failure here.
+    expect(generation()).toEqual({
+      token: "discord-bot-token",
+      defaultChannelId: OLD_CHANNEL,
+      cmdToken: "discord-bot-token",
+      cmdChannelId: OLD_CHANNEL,
+    });
+
+    host.releaseCompanyLookup();
+    await delivery;
+
+    expect(generation()).toEqual({
+      token: "rotated-token",
+      defaultChannelId: NEW_CHANNEL,
+      cmdToken: "rotated-token",
+      cmdChannelId: NEW_CHANNEL,
+    });
+    expect(_getRuntimeForTests()?.linkBaseUrl).toContain("/SOO");
   });
 });
 

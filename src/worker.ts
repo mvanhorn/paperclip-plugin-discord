@@ -1046,10 +1046,18 @@ async function ingestInbound(
     }) as EscalationRecord | null;
     // Backward-compat fallback: check "default" scope if company-scoped read returns null
     if (!record && escalationCompanyId !== "default") {
-      record = await readLegacyDefaultScopeState(
-        ctx,
-        `escalation_${mapping.entityId}`,
-      ) as EscalationRecord | null;
+      try {
+        record = await readLegacyDefaultScopeState(
+          ctx,
+          `escalation_${mapping.entityId}`,
+        ) as EscalationRecord | null;
+      } catch (err) {
+        ctx.logger.error("Inbound text not routed: the escalation record was unreadable", {
+          escalationId: mapping.entityId,
+          error: summarizeError(err),
+        });
+        return "rejected";
+      }
     }
 
     // Two state reads happened above; nothing has been written yet.
@@ -1415,6 +1423,13 @@ async function bootstrapRuntime(
       existing.voiceEnabled === voiceEnabled,
   );
 
+  // Resolved before the runtime is touched: everything below is one synchronous
+  // block, so a concurrent `ensureRuntime()` can never read a half-updated object.
+  const linkBaseUrl = buildLinkBaseUrl(
+    baseUrl,
+    await resolveCompanyIssuePrefix(ctx, companyId, baseUrl, paperclipBoardApiKey),
+  );
+
   // Refresh the EXISTING object rather than replacing it, so a reused gateway's
   // callbacks observe the new configuration immediately.
   const rt: DiscordRuntime = existing ?? ({} as DiscordRuntime);
@@ -1424,10 +1439,7 @@ async function bootstrapRuntime(
   rt.tokenSecretId = normalizeSecretRefId(config.discordBotTokenRef) ?? "";
   rt.paperclipBoardApiKey = paperclipBoardApiKey;
   rt.baseUrl = baseUrl;
-  rt.linkBaseUrl = buildLinkBaseUrl(
-    baseUrl,
-    await resolveCompanyIssuePrefix(ctx, companyId, baseUrl, paperclipBoardApiKey),
-  );
+  rt.linkBaseUrl = linkBaseUrl;
   rt.cmdCtx = {
     baseUrl,
     companyId,

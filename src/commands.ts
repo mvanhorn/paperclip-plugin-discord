@@ -1393,10 +1393,24 @@ async function handleEscalationButton(
   ctx.logger.info("Escalation button clicked", { escalationId, action, actor, embeddedCompanyId });
 
   const companyIdForLookup = embeddedCompanyId ?? await resolveCompanyId(ctx);
-  const record = await getEscalation(ctx, escalationId, companyIdForLookup) as {
+  type EscalationButtonRecord = {
     escalationId: string; companyId: string; agentName: string;
     reason: string; suggestedReply?: string; status: string;
-  } | null;
+  };
+  let record: EscalationButtonRecord | null;
+  try {
+    record = (await getEscalation(ctx, escalationId, companyIdForLookup)) as EscalationButtonRecord | null;
+  } catch (err) {
+    ctx.logger.error("Escalation record could not be read", {
+      escalationId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return respondToInteraction({
+      type: 4,
+      content: `Could not read escalation \`${escalationId}\` right now. Nothing was changed — try again shortly.`,
+      ephemeral: true,
+    });
+  }
 
   if (!record) {
     return respondToInteraction({ type: 4, content: `Escalation \`${escalationId}\` not found.`, ephemeral: true });

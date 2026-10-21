@@ -17,7 +17,18 @@ function makeCtx(stateGet: () => Promise<unknown>) {
   } as unknown as PluginContext;
 }
 
-const refusing = () => Promise.reject(new Error("company 'default' is not authorized"));
+/** Verbatim shape of the SDK's `InvocationScopeDeniedError`, as it reaches the worker. */
+function scopeDenied(): Error {
+  const err = new Error(
+    'Plugin "paperclip-plugin-discord" is not allowed to perform "state.get": ' +
+      'requested company "default" but the current invocation is scoped to company ' +
+      '"44806279-f8ba-4f28-a9c3-54ceeea43416"',
+  );
+  (err as Error & { code: number }).code = -32005;
+  return err;
+}
+
+const refusing = () => Promise.reject(scopeDenied());
 
 describe("readLegacyDefaultScopeState", () => {
   beforeEach(() => {
@@ -36,7 +47,7 @@ describe("readLegacyDefaultScopeState", () => {
     const report = sink.mock.calls[0][1] as PluginErrorReport;
     expect(report.source).toBe("legacy-state");
     expect(report.summary).toContain("escalation_pending_ids");
-    expect(report.detail).toContain("not authorized");
+    expect(report.detail).toContain("is not allowed to perform");
   });
 
   it("reports the same stateKey only once", async () => {
