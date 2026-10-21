@@ -161,6 +161,27 @@ describe("reportPluginError", () => {
 
     expect(sink).toHaveBeenCalledTimes(1);
   });
+
+  it("does not let a failing send clear a mark written after an ownership reset", async () => {
+    let releaseFirstSend: (delivered: boolean) => void = () => {};
+    const sink = vi
+      .fn()
+      .mockImplementationOnce(() => new Promise<boolean>((resolve) => (releaseFirstSend = resolve)))
+      .mockResolvedValue(true);
+    setPluginErrorSink(sink);
+    const ctx = makeCtx(refusing);
+    const report = { source: "worker", summary: "gateway lost" };
+
+    const outgoing = reportPluginError(ctx, report);
+    resetPluginErrorReports();
+    await reportPluginError(ctx, report);
+    releaseFirstSend(false);
+    await outgoing;
+
+    await reportPluginError(ctx, report);
+
+    expect(sink).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("formatPluginError", () => {

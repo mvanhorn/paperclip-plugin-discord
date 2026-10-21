@@ -585,8 +585,7 @@ export async function handleAcpOutput(
   const { sessionId, threadId, agentName, output, status } = event;
   const eventCompanyId = event.companyId || "default";
 
-  // An unreadable session list must not be overwritten with a list built from
-  // nothing; the output is still relayed, without session bookkeeping.
+  // Null means the list was unreadable, not that the thread has no sessions.
   let sessions: AgentSessionEntry[] | null = null;
   try {
     sessions = await getThreadSessions(ctx, threadId, eventCompanyId);
@@ -599,7 +598,8 @@ export async function handleAcpOutput(
   }
 
   let displayName = agentName;
-  let multiAgent = false;
+  // No list is no evidence of a single-agent thread, so names stay on.
+  let multiAgent = sessions === null;
 
   if (sessions) {
     let session = sessions.find((s) => s.sessionId === sessionId);

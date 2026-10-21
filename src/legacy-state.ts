@@ -7,10 +7,7 @@ export const INVOCATION_SCOPE_DENIED_CODE = -32005;
 /** Mirrors the message `InvocationScopeDeniedError` builds in the SDK's host client. */
 const INVOCATION_SCOPE_DENIED_MESSAGE = / is not allowed to perform "/;
 
-/**
- * True only for the host refusing a cross-company scope, the single failure a
- * legacy `"default"`-scope read may treat as "no data".
- */
+/** True only for the host refusing a cross-company scope. */
 export function isInvocationScopeDenied(err: unknown): boolean {
   if (typeof err !== "object" || err === null) return false;
   const candidate = err as { name?: unknown; code?: unknown; message?: unknown };
@@ -22,14 +19,7 @@ export function isInvocationScopeDenied(err: unknown): boolean {
   );
 }
 
-/**
- * Read state written under the legacy literal company scope `"default"`.
- *
- * A refused read means the host will not serve that scope to this invocation,
- * which is indistinguishable from the key never having been written — it
- * returns null. Every other failure throws: callers must not mistake an
- * unreadable store for an empty one.
- */
+/** Read state written under the legacy literal company scope `"default"`; null when refused, throws otherwise. */
 export async function readLegacyDefaultScopeState(
   ctx: PluginContext,
   stateKey: string,

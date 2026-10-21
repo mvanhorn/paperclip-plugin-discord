@@ -13,8 +13,19 @@ export type PluginErrorSink = (ctx: PluginContext, report: PluginErrorReport) =>
 
 const ERROR_REPORT_DEDUP_TTL_MS = 60 * 60 * 1000;
 
+interface SentReportMark {
+  at: number;
+  token: number;
+}
+
 let sink: PluginErrorSink | null = null;
-const sentReports = new Map<string, number>();
+let nextMarkToken = 0;
+const sentReports = new Map<string, SentReportMark>();
+
+/** Drop a mark only while it still belongs to the send that wrote it. */
+function releaseMark(dedupKey: string, token: number): void {
+  if (sentReports.get(dedupKey)?.token === token) sentReports.delete(dedupKey);
+}
 
 /** Install the transport that delivers degradation reports, replacing any previous one. */
 export function setPluginErrorSink(next: PluginErrorSink | null): void {
@@ -33,8 +44,8 @@ export async function reportPluginError(
   report: PluginErrorReport,
 ): Promise<void> {
   const now = Date.now();
-  for (const [key, ts] of sentReports) {
-    if (now - ts > ERROR_REPORT_DEDUP_TTL_MS) sentReports.delete(key);
+  for (const [key, mark] of sentReports) {
+    if (now - mark.at > ERROR_REPORT_DEDUP_TTL_MS) sentReports.delete(key);
   }
 
   const target = sink;
@@ -42,13 +53,14 @@ export async function reportPluginError(
 
   const dedupKey = report.dedupKey ?? `${report.source}:${report.summary}`;
   if (sentReports.has(dedupKey)) return;
-  sentReports.set(dedupKey, now);
+  const token = nextMarkToken++;
+  sentReports.set(dedupKey, { at: now, token });
 
   try {
     // An undelivered report must not consume the dedup window.
-    if (!(await target(ctx, report))) sentReports.delete(dedupKey);
+    if (!(await target(ctx, report))) releaseMark(dedupKey, token);
   } catch (err) {
-    sentReports.delete(dedupKey);
+    releaseMark(dedupKey, token);
     ctx.logger.warn("Reporting a degraded Discord plugin path failed", {
       source: report.source,
       error: err instanceof Error ? err.message : String(err),

@@ -1429,8 +1429,7 @@ async function bootstrapRuntime(
       existing.voiceEnabled === voiceEnabled,
   );
 
-  // Resolved before the runtime is touched: everything below is one synchronous
-  // block, so a concurrent `ensureRuntime()` can never read a half-updated object.
+  // Resolved before the runtime is touched, keeping the assignments below synchronous.
   const linkBaseUrl = buildLinkBaseUrl(
     baseUrl,
     await resolveCompanyIssuePrefix(ctx, companyId, baseUrl, paperclipBoardApiKey),

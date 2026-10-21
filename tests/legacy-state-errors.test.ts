@@ -184,6 +184,41 @@ describe("a thread's session list that cannot be read", () => {
     expect(stateSet).not.toHaveBeenCalled();
     expect(ctx.logger.error).toHaveBeenCalled();
   });
+
+  it("keeps the agent name on every queued message in the batch", async () => {
+    vi.useFakeTimers();
+    try {
+      const { ctx } = makeCtx(transientFailure());
+      const thread = "thread-unreadable-batch";
+
+      await handleAcpOutput(ctx, "bot-token", {
+        sessionId: "acp-1",
+        threadId: thread,
+        agentName: "Backend",
+        output: "from backend",
+        companyId: COMPANY_ID,
+      });
+      await handleAcpOutput(ctx, "bot-token", {
+        sessionId: "acp-2",
+        threadId: thread,
+        agentName: "Frontend",
+        output: "from frontend",
+        companyId: COMPANY_ID,
+      });
+
+      await vi.advanceTimersByTimeAsync(1000);
+
+      const posted = (ctx.http.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls
+        .filter(([url]) => String(url).endsWith(`/channels/${thread}/messages`))
+        .map(([, init]) => JSON.parse(String((init as RequestInit).body)).content as string);
+
+      expect(posted).toHaveLength(2);
+      expect(posted[0]).toContain("**[Backend]** ");
+      expect(posted[1]).toContain("**[Frontend]** ");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("button handlers answer instead of crashing on an unreadable record", () => {
