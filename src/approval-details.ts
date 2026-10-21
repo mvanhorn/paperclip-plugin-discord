@@ -1,0 +1,90 @@
+import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { paperclipFetch } from "./paperclip-fetch.js";
+
+const APPROVAL_LOOKUP_TIMEOUT_MS = 5_000;
+
+export interface ApprovalRecord {
+  id: string;
+  type?: string | null;
+  status?: string | null;
+  requestedByAgentId?: string | null;
+  requestedByUserId?: string | null;
+  payload?: Record<string, unknown> | null;
+}
+
+/** The slice of `PluginApprovalsClient` this module uses, when the host exposes it. */
+interface ApprovalsClientLike {
+  get?: (approvalId: string, companyId: string) => Promise<unknown>;
+}
+
+export interface ApprovalLookup {
+  record: ApprovalRecord | null;
+  /** Why the read failed, set only when a lookup ran and did not produce a record. */
+  failure: string | null;
+}
+
+function toRecord(value: unknown): ApprovalRecord | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Record<string, unknown>;
+  const id = typeof row.id === "string" ? row.id : null;
+  if (!id) return null;
+  return {
+    id,
+    type: typeof row.type === "string" ? row.type : null,
+    status: typeof row.status === "string" ? row.status : null,
+    requestedByAgentId: typeof row.requestedByAgentId === "string" ? row.requestedByAgentId : null,
+    requestedByUserId: typeof row.requestedByUserId === "string" ? row.requestedByUserId : null,
+    payload:
+      row.payload && typeof row.payload === "object" && !Array.isArray(row.payload)
+        ? (row.payload as Record<string, unknown>)
+        : null,
+  };
+}
+
+/** Read the approval row behind an `approval.created` event. Never throws; reports why a read came back empty. */
+export async function fetchApprovalRecord(
+  ctx: PluginContext,
+  approvalId: string,
+  companyId: string,
+  baseUrl: string,
+  apiKey?: string,
+): Promise<ApprovalLookup> {
+  if (!approvalId) return { record: null, failure: null };
+
+  let failure: string | null = null;
+
+  const approvals = (ctx as unknown as { approvals?: ApprovalsClientLike }).approvals;
+  if (companyId && typeof approvals?.get === "function") {
+    try {
+      const record = toRecord(await approvals.get(approvalId, companyId));
+      if (record) return { record, failure: null };
+      failure = "ctx.approvals.get returned no approval row";
+    } catch (err) {
+      failure = `ctx.approvals.get: ${String(err)}`;
+      ctx.logger.debug("Approval unavailable via ctx.approvals.get; trying the API", {
+        approvalId,
+        error: String(err),
+      });
+    }
+  }
+
+  const api = (baseUrl || "").trim().replace(/\/+$/, "");
+  if (!api) return { record: null, failure };
+
+  try {
+    const response = await paperclipFetch(
+      `${api}/api/approvals/${encodeURIComponent(approvalId)}`,
+      { method: "GET", signal: AbortSignal.timeout(APPROVAL_LOOKUP_TIMEOUT_MS) },
+      apiKey || undefined,
+    );
+    const record = toRecord(await response.json());
+    if (record) return { record, failure: null };
+    return { record: null, failure: "GET /api/approvals returned no approval row" };
+  } catch (err) {
+    ctx.logger.warn("Failed to read the approval behind approval.created; the card will show less detail", {
+      approvalId,
+      error: String(err),
+    });
+    return { record: null, failure: `GET /api/approvals: ${String(err)}` };
+  }
+}

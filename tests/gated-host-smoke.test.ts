@@ -83,7 +83,10 @@ function buildGatedHost() {
     data: { register: vi.fn((key: string) => registered.data.push(key)) },
     actions: { register: vi.fn((key: string) => registered.actions.push(key)) },
     events: { on: vi.fn(), emit: vi.fn(), subscribe: vi.fn() },
-    companies: { list: vi.fn(async () => [{ id: COMPANY, name: "Acme" }]) },
+    companies: {
+      list: vi.fn(async () => [{ id: COMPANY, name: "Acme" }]),
+      get: vi.fn(async () => ({ id: COMPANY, name: "Acme", issuePrefix: "ACME" })),
+    },
     agents: { list: vi.fn(async () => []), invoke: vi.fn() },
     issues: { list: vi.fn(async () => []), get: vi.fn(async () => null), listComments: vi.fn(async () => []) },
     http: { fetch: vi.fn(async () => ({ ok: false, status: 500, json: async () => ({}), text: async () => "" })) },

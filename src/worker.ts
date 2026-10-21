@@ -27,7 +27,17 @@ import {
   formatAgentRunStarted,
   formatAgentRunFinished,
   humanizePriority,
+  buildLinkBaseUrl,
+  formatPluginError,
 } from "./formatters.js";
+import { resolveCompanyIssuePrefix } from "./company-prefix.js";
+import { readLegacyDefaultScopeState } from "./legacy-state.js";
+import { fetchApprovalRecord } from "./approval-details.js";
+import {
+  setPluginErrorSink,
+  reportPluginError,
+  resetPluginErrorReports,
+} from "./error-reporting.js";
 import { handleInteraction, SLASH_COMMANDS, type CommandContext } from "./commands.js";
 import { runIntelligenceScan, runBackfill } from "./intelligence.js";
 import { connectGateway, type GatewayHandle, type MessageCreateEvent } from "./gateway.js";
@@ -232,7 +242,10 @@ type DiscordRuntime = {
   token: string;
   tokenSecretId: string;
   paperclipBoardApiKey: string;
+  /** API base URL, never company-prefixed. */
   baseUrl: string;
+  /** Deep-link base URL: `baseUrl` under the company prefix when resolvable. */
+  linkBaseUrl: string;
   cmdCtx: CommandContext;
   adapter: DiscordAdapter;
   gateway: GatewayHandle | null;
@@ -569,6 +582,135 @@ export async function enrichRunPayload(
   return payload;
 }
 
+/** How many linked issues an approval card resolves before it stops looking. */
+const MAX_ENRICHED_LINKED_ISSUES = 5;
+
+/** Fill an `approval.created` payload with the approval row, requester name and linked issue detail. Never throws. */
+export async function enrichApprovalPayload(
+  ctx: PluginContext,
+  event: PluginEvent,
+  opts: { companyId?: string; baseUrl: string; apiKey?: string },
+): Promise<Record<string, unknown>> {
+  const payload = { ...(event.payload as Record<string, unknown>) };
+  const approvalId =
+    (typeof payload.approvalId === "string" && payload.approvalId) || event.entityId || "";
+  if (!approvalId) return payload;
+  payload.approvalId = approvalId;
+
+  const companyId =
+    (typeof event.companyId === "string" && event.companyId) || opts.companyId || "";
+
+  const degradedDetails: string[] = [];
+  const failedIssueIds: string[] = [];
+
+  try {
+    const { record: approval, failure } = await fetchApprovalRecord(
+      ctx,
+      approvalId,
+      companyId,
+      opts.baseUrl,
+      opts.apiKey,
+    );
+    if (failure) degradedDetails.push(`approval record: ${failure}`);
+    if (approval) {
+      // The event payload is the record of what fired, so it wins on conflict.
+      for (const [key, value] of Object.entries(approval.payload ?? {})) {
+        if (payload[key] == null) payload[key] = value;
+      }
+      if (payload.type == null && approval.type) payload.type = approval.type;
+      if (payload.agentId == null && approval.requestedByAgentId) {
+        payload.agentId = approval.requestedByAgentId;
+      }
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    degradedDetails.push(`approval record: ${detail}`);
+    ctx.logger.debug("Approval record lookup failed", { approvalId, error: detail });
+  }
+
+  try {
+    const requesterAgentId =
+      (typeof payload.agentId === "string" && payload.agentId) ||
+      (typeof event.actorId === "string" && event.actorId) ||
+      null;
+    if (!payload.agentName && requesterAgentId && companyId) {
+      const agents = (await ctx.agents.list({ companyId })) as Array<{ id: string; name: string }>;
+      const match = agents.find((a) => a.id === requesterAgentId);
+      if (match?.name) payload.agentName = match.name;
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    degradedDetails.push(`requester name: ${detail}`);
+    ctx.logger.debug("Approval requester name lookup failed", { approvalId, error: detail });
+  }
+
+  try {
+    if (!Array.isArray(payload.linkedIssues) && companyId) {
+      const issueIds = Array.isArray(payload.issueIds)
+        ? (payload.issueIds as unknown[]).filter((id): id is string => typeof id === "string")
+        : [];
+      const linked: Array<Record<string, unknown>> = [];
+      for (const issueId of issueIds.slice(0, MAX_ENRICHED_LINKED_ISSUES)) {
+        try {
+          const issue = (await ctx.issues.get(issueId, companyId)) as {
+            id: string;
+            identifier?: string | null;
+            title?: string | null;
+            status?: string | null;
+            priority?: string | null;
+          } | null;
+          if (issue) {
+            linked.push({
+              id: issue.id,
+              identifier: issue.identifier ?? null,
+              title: issue.title ?? null,
+              status: issue.status ?? null,
+              priority: issue.priority ?? null,
+            });
+          }
+        } catch (error) {
+          failedIssueIds.push(issueId);
+          ctx.logger.debug("Linked issue lookup failed", {
+            approvalId,
+            issueId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      if (linked.length > 0) payload.linkedIssues = linked;
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    degradedDetails.push(`linked issues: ${detail}`);
+    ctx.logger.debug("Approval linked issue enrichment failed", { approvalId, error: detail });
+  }
+
+  if (failedIssueIds.length > 0) {
+    payload.failedIssueIds = failedIssueIds;
+    degradedDetails.push(`unresolved linked issues: ${failedIssueIds.join(", ")}`);
+  }
+
+  if (degradedDetails.length > 0) {
+    payload.enrichmentDegraded = true;
+    await reportPluginError(ctx, {
+      source: "approval-enrichment",
+      summary:
+        failedIssueIds.length > 0
+          ? `Approval \`${approvalId}\` could not resolve ${failedIssueIds.length} linked issue(s); the card falls back to deep links.`
+          : `Approval \`${approvalId}\` was enriched only partially; the card may be missing detail.`,
+      detail: degradedDetails.join("\n"),
+      companyId: companyId || undefined,
+      // A whole-stage outage repeats on every approval, so it dedups by stage rather than by approval.
+      dedupKey:
+        failedIssueIds.length > 0
+          ? `approval-enrichment:${approvalId}`
+          : `approval-enrichment:stage:${companyId}:${degradedDetails.map((d) => d.split(":")[0]).join(",")}`,
+    });
+  }
+
+  return payload;
+}
+
 // ---------------------------------------------------------------------------
 // Notification helpers
 // ---------------------------------------------------------------------------
@@ -632,7 +774,7 @@ async function notify(
   );
   if (!channelId) return;
 
-  const message = formatter(event, rt.baseUrl);
+  const message = formatter(event, rt.linkBaseUrl || rt.baseUrl);
   const messageId = await postEmbedWithId(ctx, rt.token, channelId, message);
 
   if (messageId) {
@@ -908,11 +1050,18 @@ async function ingestInbound(
     }) as EscalationRecord | null;
     // Backward-compat fallback: check "default" scope if company-scoped read returns null
     if (!record && escalationCompanyId !== "default") {
-      record = await ctx.state.get({
-        scopeKind: "company",
-        scopeId: "default",
-        stateKey: `escalation_${mapping.entityId}`,
-      }) as EscalationRecord | null;
+      try {
+        record = await readLegacyDefaultScopeState(
+          ctx,
+          `escalation_${mapping.entityId}`,
+        ) as EscalationRecord | null;
+      } catch (err) {
+        ctx.logger.error("Inbound text not routed: the escalation record was unreadable", {
+          escalationId: mapping.entityId,
+          error: summarizeError(err),
+        });
+        return "rejected";
+      }
     }
 
     // Two state reads happened above; nothing has been written yet.
@@ -1149,6 +1298,8 @@ function claimOwnership(ctx: PluginContext, companyId: string, config: unknown):
     // the new owner may not even have a secret binding — and a live connection
     // belonging to a company that no longer owns the install is worse than none.
     retireRuntime(ctx, `owner advanced to company ${companyId}`);
+    // The dedup window was earned against the outgoing company's errors channel.
+    resetPluginErrorReports();
     ownerCompanyId = companyId;
     ownerConfigJson = configJson;
     refusedCompanies.delete(companyId);
@@ -1278,6 +1429,12 @@ async function bootstrapRuntime(
       existing.voiceEnabled === voiceEnabled,
   );
 
+  // Resolved before the runtime is touched, keeping the assignments below synchronous.
+  const linkBaseUrl = buildLinkBaseUrl(
+    baseUrl,
+    await resolveCompanyIssuePrefix(ctx, companyId, baseUrl, paperclipBoardApiKey),
+  );
+
   // Refresh the EXISTING object rather than replacing it, so a reused gateway's
   // callbacks observe the new configuration immediately.
   const rt: DiscordRuntime = existing ?? ({} as DiscordRuntime);
@@ -1287,6 +1444,7 @@ async function bootstrapRuntime(
   rt.tokenSecretId = normalizeSecretRefId(config.discordBotTokenRef) ?? "";
   rt.paperclipBoardApiKey = paperclipBoardApiKey;
   rt.baseUrl = baseUrl;
+  rt.linkBaseUrl = linkBaseUrl;
   rt.cmdCtx = {
     baseUrl,
     companyId,
@@ -1934,6 +2092,19 @@ const plugin = definePlugin({
   async setup(ctx) {
     _pluginCtx = ctx;
 
+    // Degradation reports reach Discord through the live runtime's errors channel.
+    setPluginErrorSink(async (reportCtx, report) => {
+      const rt = runtime;
+      if (!rt) return false;
+      const channelId = await resolveChannel(
+        reportCtx,
+        report.companyId ?? rt.companyId,
+        rt.errorsChannelId ?? rt.defaultChannelId,
+      );
+      if (!channelId) return false;
+      return await postEmbed(reportCtx, rt.token, channelId, formatPluginError(report));
+    });
+
     // Handlers are registered unconditionally.
     //
     // The feature flags that used to gate these registrations live in company-
@@ -1999,10 +2170,15 @@ const plugin = definePlugin({
     ctx.events.on("approval.created", async (event: PluginEvent) => {
       const rt = await ensureRuntime(ctx, event.companyId);
       if (!rt || !rt.config.notifyOnApprovalCreated) return;
+      const payload = await enrichApprovalPayload(ctx, event, {
+        companyId: rt.companyId,
+        baseUrl: rt.baseUrl,
+        apiKey: rt.paperclipBoardApiKey,
+      });
       await notify(
         ctx,
         rt,
-        event,
+        { ...event, payload },
         formatApprovalCreated,
         rt.approvalsChannelId ?? undefined,
         rt.config.approvalsChannels,
