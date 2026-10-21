@@ -21,6 +21,7 @@ interface SentReportMark {
 let sink: PluginErrorSink | null = null;
 let nextMarkToken = 0;
 const sentReports = new Map<string, SentReportMark>();
+const inFlightReports = new Set<Promise<void>>();
 
 /** Drop a mark only while it still belongs to the send that wrote it. */
 function releaseMark(dedupKey: string, token: number): void {
@@ -65,5 +66,23 @@ export async function reportPluginError(
       source: report.source,
       error: err instanceof Error ? err.message : String(err),
     });
+  }
+}
+
+/** Start a report without waiting for delivery, for callers that must not block on Discord. */
+export function reportPluginErrorInBackground(
+  ctx: PluginContext,
+  report: PluginErrorReport,
+): void {
+  const pending = reportPluginError(ctx, report);
+  inFlightReports.add(pending);
+  const forget = () => inFlightReports.delete(pending);
+  void pending.then(forget, forget);
+}
+
+/** Wait for every background report that has already started. */
+export async function flushPluginErrorReports(): Promise<void> {
+  while (inFlightReports.size > 0) {
+    await Promise.allSettled([...inFlightReports]);
   }
 }
