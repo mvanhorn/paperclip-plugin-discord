@@ -1,7 +1,6 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { paperclipFetch } from "./paperclip-fetch.js";
 
-/** Read the approval row behind an `approval.created` event, returning null on any failure. */
 const APPROVAL_LOOKUP_TIMEOUT_MS = 5_000;
 
 export interface ApprovalRecord {
@@ -36,6 +35,7 @@ function toRecord(value: unknown): ApprovalRecord | null {
   };
 }
 
+/** Read the approval row behind an `approval.created` event, returning null on any failure. */
 export async function fetchApprovalRecord(
   ctx: PluginContext,
   approvalId: string,
