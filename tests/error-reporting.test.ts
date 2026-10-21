@@ -26,7 +26,7 @@ describe("readLegacyDefaultScopeState", () => {
   });
 
   it("returns null and reports once when the host refuses the read", async () => {
-    const sink = vi.fn().mockResolvedValue(undefined);
+    const sink = vi.fn().mockResolvedValue(true);
     setPluginErrorSink(sink);
     const ctx = makeCtx(refusing);
 
@@ -40,7 +40,7 @@ describe("readLegacyDefaultScopeState", () => {
   });
 
   it("reports the same stateKey only once", async () => {
-    const sink = vi.fn().mockResolvedValue(undefined);
+    const sink = vi.fn().mockResolvedValue(true);
     setPluginErrorSink(sink);
     const ctx = makeCtx(refusing);
 
@@ -52,7 +52,7 @@ describe("readLegacyDefaultScopeState", () => {
   });
 
   it("reports each distinct stateKey once", async () => {
-    const sink = vi.fn().mockResolvedValue(undefined);
+    const sink = vi.fn().mockResolvedValue(true);
     setPluginErrorSink(sink);
     const ctx = makeCtx(refusing);
 
@@ -75,13 +75,40 @@ describe("readLegacyDefaultScopeState", () => {
     expect(ctx.logger.warn).toHaveBeenCalled();
   });
 
+  it("retries the report after the sink reports a failed delivery", async () => {
+    const sink = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
+    setPluginErrorSink(sink);
+    const ctx = makeCtx(refusing);
+
+    await readLegacyDefaultScopeState(ctx, "handoff_h-1");
+    await readLegacyDefaultScopeState(ctx, "handoff_h-1");
+    await readLegacyDefaultScopeState(ctx, "handoff_h-1");
+
+    expect(sink).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries the report after the sink throws", async () => {
+    const sink = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("discord is down"))
+      .mockResolvedValue(true);
+    setPluginErrorSink(sink);
+    const ctx = makeCtx(refusing);
+
+    await readLegacyDefaultScopeState(ctx, "handoff_h-1");
+    await readLegacyDefaultScopeState(ctx, "handoff_h-1");
+    await readLegacyDefaultScopeState(ctx, "handoff_h-1");
+
+    expect(sink).toHaveBeenCalledTimes(2);
+  });
+
   it("swallows the refusal when no sink is registered", async () => {
     const ctx = makeCtx(refusing);
     await expect(readLegacyDefaultScopeState(ctx, "discussion_d-1")).resolves.toBeNull();
   });
 
   it("passes a successful read through untouched", async () => {
-    const sink = vi.fn().mockResolvedValue(undefined);
+    const sink = vi.fn().mockResolvedValue(true);
     setPluginErrorSink(sink);
     const ctx = makeCtx(() => Promise.resolve({ sessions: [] }));
 
@@ -99,7 +126,7 @@ describe("reportPluginError", () => {
   });
 
   it("dedups on source and summary when no dedupKey is given", async () => {
-    const sink = vi.fn().mockResolvedValue(undefined);
+    const sink = vi.fn().mockResolvedValue(true);
     setPluginErrorSink(sink);
     const ctx = makeCtx(refusing);
 
@@ -111,7 +138,7 @@ describe("reportPluginError", () => {
   });
 
   it("sends only one report for concurrent calls", async () => {
-    const sink = vi.fn().mockResolvedValue(undefined);
+    const sink = vi.fn().mockResolvedValue(true);
     setPluginErrorSink(sink);
     const ctx = makeCtx(refusing);
 

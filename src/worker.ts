@@ -1948,14 +1948,14 @@ const plugin = definePlugin({
     // Degradation reports reach Discord through the live runtime's errors channel.
     setPluginErrorSink(async (reportCtx, report) => {
       const rt = runtime;
-      if (!rt) return;
+      if (!rt) return false;
       const channelId = await resolveChannel(
         reportCtx,
         report.companyId ?? rt.companyId,
         rt.errorsChannelId ?? rt.defaultChannelId,
       );
-      if (!channelId) return;
-      await postEmbed(reportCtx, rt.token, channelId, formatPluginError(report));
+      if (!channelId) return false;
+      return await postEmbed(reportCtx, rt.token, channelId, formatPluginError(report));
     });
 
     // Handlers are registered unconditionally.

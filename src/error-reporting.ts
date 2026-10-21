@@ -8,7 +8,8 @@ export interface PluginErrorReport {
   dedupKey?: string;
 }
 
-export type PluginErrorSink = (ctx: PluginContext, report: PluginErrorReport) => Promise<void>;
+/** Delivers a report, resolving to whether it actually reached the error channel. */
+export type PluginErrorSink = (ctx: PluginContext, report: PluginErrorReport) => Promise<boolean>;
 
 const ERROR_REPORT_DEDUP_TTL_MS = 60 * 60 * 1000;
 
@@ -44,8 +45,10 @@ export async function reportPluginError(
   sentReports.set(dedupKey, now);
 
   try {
-    await target(ctx, report);
+    // An undelivered report must not consume the dedup window.
+    if (!(await target(ctx, report))) sentReports.delete(dedupKey);
   } catch (err) {
+    sentReports.delete(dedupKey);
     ctx.logger.warn("Reporting a degraded Discord plugin path failed", {
       source: report.source,
       error: err instanceof Error ? err.message : String(err),
