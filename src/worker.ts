@@ -2092,15 +2092,13 @@ const plugin = definePlugin({
   async setup(ctx) {
     _pluginCtx = ctx;
 
-    // Degradation reports reach Discord through the live runtime's errors channel.
+    // Degradation reports go to the configured errors channel, and only fall back to general routing when none is configured.
     setPluginErrorSink(async (reportCtx, report) => {
       const rt = runtime;
       if (!rt) return false;
-      const channelId = await resolveChannel(
-        reportCtx,
-        report.companyId ?? rt.companyId,
-        rt.errorsChannelId ?? rt.defaultChannelId,
-      );
+      const channelId =
+        rt.errorsChannelId ??
+        (await resolveChannel(reportCtx, report.companyId ?? rt.companyId, rt.defaultChannelId));
       if (!channelId) return false;
       return await postEmbed(reportCtx, rt.token, channelId, formatPluginError(report));
     });
