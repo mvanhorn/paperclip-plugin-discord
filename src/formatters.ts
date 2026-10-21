@@ -240,6 +240,27 @@ function renderLinkedIssueLines(
   return lines;
 }
 
+const EMBED_FIELD_VALUE_LIMIT = 1024;
+
+/** Join whole lines up to the Discord field limit, never cutting one in half, and count what was left out. */
+function joinWithinFieldLimit(lines: string[]): string {
+  const full = lines.join("\n\n");
+  if (full.length <= EMBED_FIELD_VALUE_LIMIT) return full;
+
+  const kept: string[] = [];
+  for (const line of lines) {
+    const suffix = `\n\n…and ${lines.length - kept.length - 1} more`;
+    if ([...kept, line].join("\n\n").length + suffix.length > EMBED_FIELD_VALUE_LIMIT) break;
+    kept.push(line);
+  }
+
+  if (kept.length === 0) {
+    const suffix = lines.length > 1 ? `\n\n…and ${lines.length - 1} more` : "";
+    return lines[0].slice(0, EMBED_FIELD_VALUE_LIMIT - suffix.length) + suffix;
+  }
+  return `${kept.join("\n\n")}\n\n…and ${lines.length - kept.length} more`;
+}
+
 export function formatApprovalCreated(event: PluginEvent, baseUrl?: string): DiscordMessage {
   const p = event.payload as Payload;
   const approvalType = String(p.type ?? "unknown");
@@ -259,7 +280,7 @@ export function formatApprovalCreated(event: PluginEvent, baseUrl?: string): Dis
   if (issueLines.length > 0) {
     fields.push({
       name: issueLines.length === 1 ? "Linked Issue" : `Linked Issues (${issueLines.length})`,
-      value: issueLines.join("\n\n").slice(0, 1024),
+      value: joinWithinFieldLimit(issueLines),
     });
   }
 

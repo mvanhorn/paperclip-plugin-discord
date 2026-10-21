@@ -73,7 +73,7 @@ beforeEach(() => {
   setPluginErrorSink(null);
   resetPluginErrorReports();
   mocks.fetchApprovalRecord.mockReset();
-  mocks.fetchApprovalRecord.mockResolvedValue(null);
+  mocks.fetchApprovalRecord.mockResolvedValue({ record: null, failure: null });
 });
 
 describe("enrichApprovalPayload linked issue fault isolation", () => {
@@ -164,10 +164,13 @@ describe("enrichApprovalPayload stage isolation", () => {
 
   it("merges the approval row payload without overwriting the event payload", async () => {
     mocks.fetchApprovalRecord.mockResolvedValue({
-      id: "apr-1",
-      type: "budget",
-      requestedByAgentId: "requester-agent",
-      payload: { title: "From the approval row", description: "Why this matters" },
+      record: {
+        id: "apr-1",
+        type: "budget",
+        requestedByAgentId: "requester-agent",
+        payload: { title: "From the approval row", description: "Why this matters" },
+      },
+      failure: null,
     });
     const ctx = makeCtx({ issues: { get: issuesGet([]) } });
 
@@ -178,6 +181,34 @@ describe("enrichApprovalPayload stage isolation", () => {
     expect(payload.type).toBe("strategy");
     expect(payload.agentId).toBe("requester-agent");
     expect(payload.enrichmentDegraded).toBeUndefined();
+  });
+
+  it("treats an approval lookup that returns no row as degraded, not as silence", async () => {
+    const sink = vi.fn().mockResolvedValue(true);
+    setPluginErrorSink(sink);
+    mocks.fetchApprovalRecord.mockResolvedValue({
+      record: null,
+      failure: "GET /api/approvals: 401 Unauthorized",
+    });
+    const ctx = makeCtx({ issues: { get: issuesGet([]) } });
+
+    const payload = await enrichApprovalPayload(ctx, makeApprovalEvent(), OPTS);
+
+    expect(payload.enrichmentDegraded).toBe(true);
+    expect(payload.linkedIssues).toHaveLength(3);
+    expect(sink).toHaveBeenCalledTimes(1);
+    expect((sink.mock.calls[0][1] as PluginErrorReport).detail).toContain("401 Unauthorized");
+  });
+
+  it("stays quiet when no approval lookup path was available", async () => {
+    const sink = vi.fn().mockResolvedValue(true);
+    setPluginErrorSink(sink);
+    const ctx = makeCtx({ issues: { get: issuesGet([]) } });
+
+    const payload = await enrichApprovalPayload(ctx, makeApprovalEvent(), OPTS);
+
+    expect(payload.enrichmentDegraded).toBeUndefined();
+    expect(sink).not.toHaveBeenCalled();
   });
 
   it("never throws, even when every stage fails", async () => {
@@ -298,13 +329,33 @@ describe("formatApprovalCreated linked issue field", () => {
     expect(field?.value).toContain("**SOO-1** Issue 1");
   });
 
-  it("truncates the field to the Discord limit", () => {
+  it("drops whole issues rather than cutting one in half at the Discord limit", () => {
     const linkedIssues = ISSUE_IDS.map((id, n) => ({
       id,
       identifier: `SOO-${n}`,
       title: "x".repeat(600),
     }));
     const field = linkedField({ issueIds: ISSUE_IDS, linkedIssues });
-    expect(field?.value.length).toBe(1024);
+
+    expect(field?.value.length).toBeLessThanOrEqual(1024);
+    expect(field?.value).toContain("**SOO-0**");
+    expect(field?.value).toMatch(/…and 2 more$/);
+  });
+
+  it("never cuts through a deep link when many issues go unresolved", () => {
+    const ids = Array.from(
+      { length: 40 },
+      (_, n) => `${String(n).padStart(8, "0")}-0000-4000-8000-000000000000`,
+    );
+    const field = linkedField({ issueIds: ids });
+
+    expect(field?.value.length).toBeLessThanOrEqual(1024);
+    expect(field?.value).toMatch(/…and \d+ more$/);
+    const rendered = field?.value.split("\n\n").filter((line) => line.startsWith("[")) ?? [];
+    for (const line of rendered) {
+      expect(line).toMatch(/^\[[0-9a-f]{8}\]\(https:\/\/\S+\/issues\/\S+\)$/);
+    }
+    const omitted = Number(/…and (\d+) more$/.exec(field?.value ?? "")?.[1]);
+    expect(rendered.length + omitted).toBe(ids.length);
   });
 });

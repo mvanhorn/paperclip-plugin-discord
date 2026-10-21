@@ -600,13 +600,14 @@ export async function enrichApprovalPayload(
   const failedIssueIds: string[] = [];
 
   try {
-    const approval = await fetchApprovalRecord(
+    const { record: approval, failure } = await fetchApprovalRecord(
       ctx,
       approvalId,
       companyId,
       opts.baseUrl,
       opts.apiKey,
     );
+    if (failure) degradedDetails.push(`approval record: ${failure}`);
     if (approval) {
       // The event payload is the record of what fired, so it wins on conflict.
       for (const [key, value] of Object.entries(approval.payload ?? {})) {
@@ -695,7 +696,11 @@ export async function enrichApprovalPayload(
           : `Approval \`${approvalId}\` was enriched only partially; the card may be missing detail.`,
       detail: degradedDetails.join("\n"),
       companyId: companyId || undefined,
-      dedupKey: `approval-enrichment:${approvalId}`,
+      // A whole-stage outage repeats on every approval, so it dedups by stage rather than by approval.
+      dedupKey:
+        failedIssueIds.length > 0
+          ? `approval-enrichment:${approvalId}`
+          : `approval-enrichment:stage:${degradedDetails.map((d) => d.split(":")[0]).join(",")}`,
     });
   }
 
