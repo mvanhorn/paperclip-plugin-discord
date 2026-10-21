@@ -33,7 +33,11 @@ import {
 import { resolveCompanyIssuePrefix } from "./company-prefix.js";
 import { readLegacyDefaultScopeState } from "./legacy-state.js";
 import { fetchApprovalRecord } from "./approval-details.js";
-import { setPluginErrorSink, reportPluginError } from "./error-reporting.js";
+import {
+  setPluginErrorSink,
+  reportPluginError,
+  resetPluginErrorReports,
+} from "./error-reporting.js";
 import { handleInteraction, SLASH_COMMANDS, type CommandContext } from "./commands.js";
 import { runIntelligenceScan, runBackfill } from "./intelligence.js";
 import { connectGateway, type GatewayHandle, type MessageCreateEvent } from "./gateway.js";
@@ -700,7 +704,7 @@ export async function enrichApprovalPayload(
       dedupKey:
         failedIssueIds.length > 0
           ? `approval-enrichment:${approvalId}`
-          : `approval-enrichment:stage:${degradedDetails.map((d) => d.split(":")[0]).join(",")}`,
+          : `approval-enrichment:stage:${companyId}:${degradedDetails.map((d) => d.split(":")[0]).join(",")}`,
     });
   }
 
@@ -1294,6 +1298,8 @@ function claimOwnership(ctx: PluginContext, companyId: string, config: unknown):
     // the new owner may not even have a secret binding — and a live connection
     // belonging to a company that no longer owns the install is worse than none.
     retireRuntime(ctx, `owner advanced to company ${companyId}`);
+    // The dedup window was earned against the outgoing company's errors channel.
+    resetPluginErrorReports();
     ownerCompanyId = companyId;
     ownerConfigJson = configJson;
     refusedCompanies.delete(companyId);

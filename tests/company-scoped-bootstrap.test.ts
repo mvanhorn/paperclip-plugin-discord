@@ -65,7 +65,11 @@ vi.mock("../src/gateway.js", () => ({
   }),
 }));
 
-import { _resetRuntimeForTests, _getRuntimeForTests } from "../src/worker.js";
+import {
+  _resetRuntimeForTests,
+  _getRuntimeForTests,
+  enrichApprovalPayload,
+} from "../src/worker.js";
 import { _resetCompanyIdCache } from "../src/company-resolver.js";
 import { _resetCompanyPrefixCache } from "../src/company-prefix.js";
 
@@ -303,6 +307,26 @@ function buildHost(options: HostOptions = {}) {
 
 function definition(): any {
   return capturedDefinitions[capturedDefinitions.length - 1];
+}
+
+/** Message posts the plugin made to Discord, which is where a degradation report lands. */
+function discordPosts(ctx: any): unknown[] {
+  return ctx.http.fetch.mock.calls.filter(([url]: [unknown]) =>
+    String(url).includes("/messages"),
+  );
+}
+
+/** An `approval.created` whose linked issue lookup fails, so enrichment reports a degradation. */
+function degradedApprovalEvent(companyId: string): any {
+  return {
+    eventType: "approval.created",
+    eventId: `evt-${Math.random().toString(36).slice(2)}`,
+    companyId,
+    entityId: "55555555-5555-5555-5555-555555555555",
+    entityType: "approval",
+    occurredAt: new Date().toISOString(),
+    payload: { type: "strategy", issueIds: ["66666666-6666-6666-6666-666666666666"] },
+  };
 }
 
 beforeEach(() => {
@@ -570,6 +594,64 @@ describe("host matrix: >= 2026.817.0 (host replays stored configuration)", () =>
     await host.deliver(COMPANY_B, { ...duplicated, defaultChannelId: "1490610083728588950" });
     expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_B);
     expect(_getRuntimeForTests()?.defaultChannelId).toBe("1490610083728588950");
+  });
+
+  it("re-opens the degradation dedup window when the owner advances to another company", async () => {
+    // `sentReports` outlives the owner. Without a reset, a failure A already
+    // reported would stay suppressed after B took the install over, and B's
+    // errors channel — a different channel — would never see it.
+    const host = buildHost({ companies: [COMPANY_A, COMPANY_B] });
+    await definition().setup(host.ctx);
+
+    const duplicated = storedConfig();
+    await host.deliver(COMPANY_A, duplicated);
+
+    host.ctx.issues.get = vi.fn(async () => {
+      throw new Error("issues.get refused");
+    });
+
+    await enrichApprovalPayload(host.ctx, degradedApprovalEvent(COMPANY_A), {
+      companyId: COMPANY_A,
+      baseUrl: "",
+    });
+    await enrichApprovalPayload(host.ctx, degradedApprovalEvent(COMPANY_A), {
+      companyId: COMPANY_A,
+      baseUrl: "",
+    });
+    expect(discordPosts(host.ctx)).toHaveLength(1);
+
+    await host.deliver(COMPANY_B, { ...duplicated });
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_B);
+
+    await enrichApprovalPayload(host.ctx, degradedApprovalEvent(COMPANY_B), {
+      companyId: COMPANY_B,
+      baseUrl: "",
+    });
+
+    expect(discordPosts(host.ctx)).toHaveLength(2);
+  });
+
+  it("keeps suppressing a repeated failure while the owner stays the same", async () => {
+    const host = buildHost({ companies: [COMPANY_A] });
+    await definition().setup(host.ctx);
+
+    await host.deliver(COMPANY_A, storedConfig());
+
+    host.ctx.issues.get = vi.fn(async () => {
+      throw new Error("issues.get refused");
+    });
+
+    await enrichApprovalPayload(host.ctx, degradedApprovalEvent(COMPANY_A), {
+      companyId: COMPANY_A,
+      baseUrl: "",
+    });
+    await host.deliver(COMPANY_A, storedConfig({ defaultGuildId: "1490610083728588950" }));
+    await enrichApprovalPayload(host.ctx, degradedApprovalEvent(COMPANY_A), {
+      companyId: COMPANY_A,
+      baseUrl: "",
+    });
+
+    expect(discordPosts(host.ctx)).toHaveLength(1);
   });
 
   it("does not bootstrap from an invocation: only a delivery starts the runtime", async () => {

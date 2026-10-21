@@ -243,6 +243,32 @@ describe("enrichApprovalPayload error channel reporting", () => {
     expect(report.detail).toContain(ISSUE_IDS[1]);
   });
 
+  it("scopes the stage dedup key to the company, so a second company still hears about it", async () => {
+    const sink = vi.fn().mockResolvedValue(true);
+    setPluginErrorSink(sink);
+    mocks.fetchApprovalRecord.mockResolvedValue({
+      record: null,
+      failure: "GET /api/approvals: 503 Service Unavailable",
+    });
+    const ctx = makeCtx({ issues: { get: issuesGet([]) } });
+
+    await enrichApprovalPayload(ctx, makeApprovalEvent(), OPTS);
+    await enrichApprovalPayload(ctx, makeApprovalEvent({ entityId: "apr-2" }), OPTS);
+    expect(sink).toHaveBeenCalledTimes(1);
+
+    await enrichApprovalPayload(ctx, makeApprovalEvent({ companyId: "co-2", entityId: "apr-3" }), {
+      ...OPTS,
+      companyId: "co-2",
+    });
+
+    expect(sink).toHaveBeenCalledTimes(2);
+    expect(sink.mock.calls.map((call) => (call[1] as PluginErrorReport).dedupKey)).toEqual([
+      "approval-enrichment:stage:co-1:approval record",
+      "approval-enrichment:stage:co-2:approval record",
+    ]);
+    expect((sink.mock.calls[1][1] as PluginErrorReport).companyId).toBe("co-2");
+  });
+
   it("does not report when nothing degraded", async () => {
     const sink = vi.fn().mockResolvedValue(true);
     setPluginErrorSink(sink);
