@@ -31,6 +31,14 @@ export function humanizePriority(raw: string): string {
   return PRIORITY_LABELS[raw] ?? raw;
 }
 
+/** Base URL for dashboard deep links: the API base under the company prefix. */
+export function buildLinkBaseUrl(baseUrl: string | undefined, issuePrefix?: string | null): string {
+  const base = (baseUrl || DEFAULT_BASE_URL).trim().replace(/\/+$/, "");
+  const prefix = (issuePrefix ?? "").trim().replace(/^\/+|\/+$/g, "");
+  if (!prefix) return base;
+  return `${base}/${encodeURIComponent(prefix)}`;
+}
+
 function resolveBaseUrl(baseUrl?: string): string | null {
   const url = (baseUrl || DEFAULT_BASE_URL).trim();
   const normalized = url.endsWith("/") ? url.slice(0, -1) : url;
@@ -194,6 +202,65 @@ function humanizeActorLabel(value: string | null): string | null {
   return trimmed;
 }
 
+function renderLinkedIssueDetail(issue: Record<string, unknown>): string {
+  const parts = [`**${issue.identifier ?? "?"}** ${issue.title ?? ""}`];
+  const meta: string[] = [];
+  if (issue.status) meta.push(String(issue.status));
+  if (issue.priority) meta.push(String(issue.priority));
+  if (issue.assignee) meta.push(`→ ${issue.assignee}`);
+  if (meta.length > 0) parts.push(`(${meta.join(" | ")})`);
+  if (issue.description) parts.push(`\n> ${String(issue.description).slice(0, 100)}`);
+  return parts.join(" ");
+}
+
+/** One line per linked issue: the resolved detail when enrichment found it, a dashboard deep link otherwise. */
+function renderLinkedIssueLines(
+  issueIds: string[],
+  linkedIssues: Array<Record<string, unknown>>,
+  dashboardBase: string | null,
+): string[] {
+  const byId = new Map<string, Record<string, unknown>>();
+  const unkeyed: Array<Record<string, unknown>> = [];
+  for (const issue of linkedIssues) {
+    const id = typeof issue.id === "string" ? issue.id : null;
+    if (id) byId.set(id, issue);
+    else unkeyed.push(issue);
+  }
+
+  const lines: string[] = [];
+  const seen = new Set<string>();
+  for (const id of [...issueIds, ...byId.keys()]) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const issue = byId.get(id);
+    if (issue) lines.push(renderLinkedIssueDetail(issue));
+    else lines.push(dashboardBase ? `[${id.slice(0, 8)}](${dashboardBase}/issues/${id})` : id);
+  }
+  for (const issue of unkeyed) lines.push(renderLinkedIssueDetail(issue));
+  return lines;
+}
+
+const EMBED_FIELD_VALUE_LIMIT = 1024;
+
+/** Join whole lines up to the Discord field limit, never cutting one in half, and count what was left out. */
+function joinWithinFieldLimit(lines: string[]): string {
+  const full = lines.join("\n\n");
+  if (full.length <= EMBED_FIELD_VALUE_LIMIT) return full;
+
+  const kept: string[] = [];
+  for (const line of lines) {
+    const suffix = `\n\n…and ${lines.length - kept.length - 1} more`;
+    if ([...kept, line].join("\n\n").length + suffix.length > EMBED_FIELD_VALUE_LIMIT) break;
+    kept.push(line);
+  }
+
+  if (kept.length === 0) {
+    const suffix = lines.length > 1 ? `\n\n…and ${lines.length - 1} more` : "";
+    return lines[0].slice(0, EMBED_FIELD_VALUE_LIMIT - suffix.length) + suffix;
+  }
+  return `${kept.join("\n\n")}\n\n…and ${lines.length - kept.length} more`;
+}
+
 export function formatApprovalCreated(event: PluginEvent, baseUrl?: string): DiscordMessage {
   const p = event.payload as Payload;
   const approvalType = String(p.type ?? "unknown");
@@ -207,32 +274,31 @@ export function formatApprovalCreated(event: PluginEvent, baseUrl?: string): Dis
   const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
   if (agentName) fields.push({ name: "Agent", value: agentName, inline: true });
   fields.push({ name: "Type", value: `\`${approvalType}\``, inline: true });
-  if (issueIds.length > 0) {
-    fields.push({ name: "Linked Issues", value: issueIds.join(", ") });
-  }
 
   const linkedIssues = Array.isArray(p.linkedIssues) ? p.linkedIssues as Array<Record<string, unknown>> : [];
-  if (linkedIssues.length > 0) {
-    const issueLines = linkedIssues.map((issue) => {
-      const parts = [`**${issue.identifier ?? "?"}** ${issue.title ?? ""}`];
-      const meta: string[] = [];
-      if (issue.status) meta.push(String(issue.status));
-      if (issue.priority) meta.push(String(issue.priority));
-      if (issue.assignee) meta.push(`→ ${issue.assignee}`);
-      if (meta.length > 0) parts.push(`(${meta.join(" | ")})`);
-      if (issue.description) parts.push(`\n> ${String(issue.description).slice(0, 100)}`);
-      return parts.join(" ");
+  const issueLines = renderLinkedIssueLines(issueIds, linkedIssues, dashboardBase);
+  if (issueLines.length > 0) {
+    fields.push({
+      name: issueLines.length === 1 ? "Linked Issue" : `Linked Issues (${issueLines.length})`,
+      value: joinWithinFieldLimit(issueLines),
     });
-    fields.push({ name: `Linked Issues (${linkedIssues.length})`, value: issueLines.join("\n\n").slice(0, 1024) });
   }
 
-  const knownKeys = new Set(["type", "approvalId", "title", "description", "agentName", "issueIds", "agentId", "runId", "linkedIssues"]);
+  const knownKeys = new Set(["type", "approvalId", "title", "description", "agentName", "issueIds", "agentId", "runId", "linkedIssues", "enrichmentDegraded", "failedIssueIds"]);
   for (const [key, value] of Object.entries(p)) {
     if (knownKeys.has(key) || value == null || value === "") continue;
     const display = typeof value === "object" ? JSON.stringify(value) : String(value);
     if (display.length > 0 && display.length <= 1024) {
       fields.push({ name: key, value: display, inline: display.length < 40 });
     }
+  }
+
+  const failedIssueIds = Array.isArray(p.failedIssueIds) ? p.failedIssueIds as string[] : [];
+  let footerText = "Paperclip";
+  if (p.enrichmentDegraded === true) {
+    footerText += failedIssueIds.length > 0
+      ? ` • ⚠️ Some linked issue details could not be loaded (${failedIssueIds.length})`
+      : " • ⚠️ Some approval details could not be loaded";
   }
 
   return {
@@ -242,7 +308,7 @@ export function formatApprovalCreated(event: PluginEvent, baseUrl?: string): Dis
         description: description || undefined,
         color: COLORS.YELLOW,
         fields,
-        footer: { text: "Paperclip" },
+        footer: { text: footerText },
         timestamp: event.occurredAt,
       },
     ],
@@ -404,6 +470,28 @@ export function formatBudgetWarning(data: BudgetWarningData): DiscordMessage {
           },
         ],
         footer: { text: "Paperclip" },
+        timestamp: new Date().toISOString(),
+      },
+    ],
+  };
+}
+
+/** Render a degraded-plugin warning for the errors channel. */
+export function formatPluginError(report: {
+  source: string;
+  summary: string;
+  detail?: string;
+}): DiscordMessage {
+  return {
+    embeds: [
+      {
+        title: "⚠️ Discord plugin degraded",
+        description: report.summary,
+        color: COLORS.ORANGE,
+        ...(report.detail
+          ? { fields: [{ name: "Detail", value: report.detail.slice(0, 1024) }] }
+          : {}),
+        footer: { text: `Paperclip • ${report.source}` },
         timestamp: new Date().toISOString(),
       },
     ],

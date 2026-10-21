@@ -136,7 +136,10 @@ function buildPluginContext(configOverrides: Record<string, unknown> = {}, state
         return () => {};
       }),
     },
-    companies: { list: vi.fn().mockResolvedValue([]) },
+    companies: {
+      list: vi.fn().mockResolvedValue([]),
+      get: vi.fn().mockResolvedValue({ id: "company-1", name: "Acme", issuePrefix: "ACME" }),
+    },
     agents: { list: vi.fn().mockResolvedValue([]), invoke: vi.fn() },
     issues: {
       list: vi.fn().mockResolvedValue([]),
@@ -259,8 +262,12 @@ describe("topic routing", () => {
     await emitEvent(eventHandlers, "approval.created", event);
 
     expect(mockDiscordFetch).toHaveBeenCalled();
+    // The errors channel may also receive a degraded-enrichment report; match the approval card itself.
     const postCall = mockDiscordFetch.mock.calls.find(
-      (call: any[]) => typeof call[0] === "string" && call[0].includes("/channels/"),
+      (call: any[]) =>
+        typeof call[0] === "string" &&
+        call[0].includes("/channels/") &&
+        String(call[1]?.body ?? "").includes("Approval: Approval"),
     );
     expect(postCall).toBeDefined();
     // Should use the override, not the topic mapping

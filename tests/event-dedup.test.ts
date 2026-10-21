@@ -145,7 +145,10 @@ function buildPluginContext(configOverrides: Record<string, unknown> = {}) {
         return () => {}; // unsubscribe noop
       }),
     },
-    companies: { list: vi.fn().mockResolvedValue([]) },
+    companies: {
+      list: vi.fn().mockResolvedValue([]),
+      get: vi.fn().mockResolvedValue({ id: TEST_COMPANY_ID, name: "Acme", issuePrefix: "ACME" }),
+    },
     agents: { list: vi.fn().mockResolvedValue([]), invoke: vi.fn() },
     issues: {
       list: vi.fn().mockResolvedValue([]),
