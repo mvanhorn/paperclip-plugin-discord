@@ -1,5 +1,5 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { reportPluginError } from "./error-reporting.js";
+import { reportPluginErrorInBackground } from "./error-reporting.js";
 
 /** Mirrors `PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED`; pinned by tests/legacy-state-errors.test.ts. */
 export const INVOCATION_SCOPE_DENIED_CODE = -32005;
@@ -19,7 +19,7 @@ export function isInvocationScopeDenied(err: unknown): boolean {
   );
 }
 
-/** Read state written under the legacy literal company scope `"default"`; null when refused, throws otherwise. */
+/** Read state written under the legacy literal company scope `"default"` without waiting on the degradation report; null when refused, throws otherwise. */
 export async function readLegacyDefaultScopeState(
   ctx: PluginContext,
   stateKey: string,
@@ -30,7 +30,7 @@ export async function readLegacyDefaultScopeState(
     if (!isInvocationScopeDenied(err)) throw err;
     const detail = err instanceof Error ? err.message : String(err);
     ctx.logger.debug("Legacy 'default'-scope state read was refused", { stateKey, error: detail });
-    await reportPluginError(ctx, {
+    reportPluginErrorInBackground(ctx, {
       source: "legacy-state",
       summary: `Legacy "default"-scope state read was refused for \`${stateKey}\`; treated as absent.`,
       detail,

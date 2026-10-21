@@ -4,6 +4,7 @@ import {
   setPluginErrorSink,
   resetPluginErrorReports,
   reportPluginError,
+  flushPluginErrorReports,
   type PluginErrorReport,
 } from "../src/error-reporting.js";
 import { readLegacyDefaultScopeState } from "../src/legacy-state.js";
@@ -42,6 +43,7 @@ describe("readLegacyDefaultScopeState", () => {
     const ctx = makeCtx(refusing);
 
     await expect(readLegacyDefaultScopeState(ctx, "escalation_pending_ids")).resolves.toBeNull();
+    await flushPluginErrorReports();
 
     expect(sink).toHaveBeenCalledTimes(1);
     const report = sink.mock.calls[0][1] as PluginErrorReport;
@@ -58,6 +60,7 @@ describe("readLegacyDefaultScopeState", () => {
     await readLegacyDefaultScopeState(ctx, "escalation_pending_ids");
     await readLegacyDefaultScopeState(ctx, "escalation_pending_ids");
     await readLegacyDefaultScopeState(ctx, "escalation_pending_ids");
+    await flushPluginErrorReports();
 
     expect(sink).toHaveBeenCalledTimes(1);
   });
@@ -70,6 +73,7 @@ describe("readLegacyDefaultScopeState", () => {
     await readLegacyDefaultScopeState(ctx, "sessions_thread-1");
     await readLegacyDefaultScopeState(ctx, "handoff_h-1");
     await readLegacyDefaultScopeState(ctx, "sessions_thread-1");
+    await flushPluginErrorReports();
 
     expect(sink).toHaveBeenCalledTimes(2);
     const keys = sink.mock.calls.map((c) => (c[1] as PluginErrorReport).dedupKey);
@@ -82,6 +86,7 @@ describe("readLegacyDefaultScopeState", () => {
     const ctx = makeCtx(refusing);
 
     await expect(readLegacyDefaultScopeState(ctx, "handoff_h-1")).resolves.toBeNull();
+    await flushPluginErrorReports();
     expect(sink).toHaveBeenCalledTimes(1);
     expect(ctx.logger.warn).toHaveBeenCalled();
   });
@@ -91,9 +96,10 @@ describe("readLegacyDefaultScopeState", () => {
     setPluginErrorSink(sink);
     const ctx = makeCtx(refusing);
 
-    await readLegacyDefaultScopeState(ctx, "handoff_h-1");
-    await readLegacyDefaultScopeState(ctx, "handoff_h-1");
-    await readLegacyDefaultScopeState(ctx, "handoff_h-1");
+    for (let i = 0; i < 3; i++) {
+      await readLegacyDefaultScopeState(ctx, "handoff_h-1");
+      await flushPluginErrorReports();
+    }
 
     expect(sink).toHaveBeenCalledTimes(2);
   });
@@ -106,9 +112,10 @@ describe("readLegacyDefaultScopeState", () => {
     setPluginErrorSink(sink);
     const ctx = makeCtx(refusing);
 
-    await readLegacyDefaultScopeState(ctx, "handoff_h-1");
-    await readLegacyDefaultScopeState(ctx, "handoff_h-1");
-    await readLegacyDefaultScopeState(ctx, "handoff_h-1");
+    for (let i = 0; i < 3; i++) {
+      await readLegacyDefaultScopeState(ctx, "handoff_h-1");
+      await flushPluginErrorReports();
+    }
 
     expect(sink).toHaveBeenCalledTimes(2);
   });
@@ -116,6 +123,21 @@ describe("readLegacyDefaultScopeState", () => {
   it("swallows the refusal when no sink is registered", async () => {
     const ctx = makeCtx(refusing);
     await expect(readLegacyDefaultScopeState(ctx, "discussion_d-1")).resolves.toBeNull();
+  });
+
+  it("returns before a slow report is delivered", async () => {
+    let releaseSend: (delivered: boolean) => void = () => {};
+    const sink = vi
+      .fn()
+      .mockImplementation(() => new Promise<boolean>((resolve) => (releaseSend = resolve)));
+    setPluginErrorSink(sink);
+    const ctx = makeCtx(refusing);
+
+    await expect(readLegacyDefaultScopeState(ctx, "escalation_pending_ids")).resolves.toBeNull();
+    expect(sink).toHaveBeenCalledTimes(1);
+
+    releaseSend(true);
+    await flushPluginErrorReports();
   });
 
   it("passes a successful read through untouched", async () => {
@@ -158,6 +180,7 @@ describe("reportPluginError", () => {
       readLegacyDefaultScopeState(ctx, "sessions_thread-1"),
       readLegacyDefaultScopeState(ctx, "sessions_thread-1"),
     ]);
+    await flushPluginErrorReports();
 
     expect(sink).toHaveBeenCalledTimes(1);
   });
