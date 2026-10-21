@@ -297,8 +297,8 @@ export function formatApprovalCreated(event: PluginEvent, baseUrl?: string): Dis
   let footerText = "Paperclip";
   if (p.enrichmentDegraded === true) {
     footerText += failedIssueIds.length > 0
-      ? ` • ⚠️ 일부 연결 이슈 정보를 불러오지 못했습니다 (${failedIssueIds.length}건)`
-      : " • ⚠️ 일부 승인 정보를 불러오지 못했습니다";
+      ? ` • ⚠️ Some linked issue details could not be loaded (${failedIssueIds.length})`
+      : " • ⚠️ Some approval details could not be loaded";
   }
 
   return {

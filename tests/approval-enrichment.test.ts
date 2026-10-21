@@ -286,7 +286,7 @@ describe("formatApprovalCreated degraded footer", () => {
     const payload = await enrichApprovalPayload(ctx, makeApprovalEvent(), OPTS);
 
     expect(renderCard(payload).embeds?.[0]?.footer?.text).toBe(
-      "Paperclip • ⚠️ 일부 연결 이슈 정보를 불러오지 못했습니다 (2건)",
+      "Paperclip • ⚠️ Some linked issue details could not be loaded (2)",
     );
   });
 
@@ -296,7 +296,7 @@ describe("formatApprovalCreated degraded footer", () => {
     const payload = await enrichApprovalPayload(ctx, makeApprovalEvent(), OPTS);
 
     expect(renderCard(payload).embeds?.[0]?.footer?.text).toBe(
-      "Paperclip • ⚠️ 일부 승인 정보를 불러오지 못했습니다",
+      "Paperclip • ⚠️ Some approval details could not be loaded",
     );
   });
 
