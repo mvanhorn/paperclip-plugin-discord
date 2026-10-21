@@ -597,9 +597,7 @@ describe("host matrix: >= 2026.817.0 (host replays stored configuration)", () =>
   });
 
   it("re-opens the degradation dedup window when the owner advances to another company", async () => {
-    // `sentReports` outlives the owner. Without a reset, a failure A already
-    // reported would stay suppressed after B took the install over, and B's
-    // errors channel — a different channel — would never see it.
+    // `sentReports` outlives the owner, so B's errors channel needs the window re-opened.
     const host = buildHost({ companies: [COMPANY_A, COMPANY_B] });
     await definition().setup(host.ctx);
 
@@ -963,8 +961,7 @@ describe("a bootstrap in flight never exposes a half-updated runtime", () => {
       cmdChannelId: OLD_CHANNEL,
     });
 
-    // The prefix lookup is the long await inside bootstrap: an uncached company
-    // whose `companies.get` is slow, or that falls back to the REST API.
+    // The prefix lookup is the long await inside bootstrap.
     _resetCompanyPrefixCache();
     host.ctx.companies.get.mockClear();
     host.deferCompanyLookup();
@@ -982,8 +979,7 @@ describe("a bootstrap in flight never exposes a half-updated runtime", () => {
       "the bootstrap to reach the issue-prefix lookup",
     );
 
-    // Mid-bootstrap, every reader still sees the previous save in full. Sending
-    // the new token to the old channel, or the reverse, is the failure here.
+    // Mid-bootstrap, every reader still sees the previous generation in full.
     expect(generation()).toEqual({
       token: "discord-bot-token",
       defaultChannelId: OLD_CHANNEL,
