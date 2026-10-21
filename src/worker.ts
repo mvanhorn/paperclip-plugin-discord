@@ -28,8 +28,11 @@ import {
   formatAgentRunFinished,
   humanizePriority,
   buildLinkBaseUrl,
+  formatPluginError,
 } from "./formatters.js";
 import { resolveCompanyIssuePrefix } from "./company-prefix.js";
+import { readLegacyDefaultScopeState } from "./legacy-state.js";
+import { setPluginErrorSink } from "./error-reporting.js";
 import { handleInteraction, SLASH_COMMANDS, type CommandContext } from "./commands.js";
 import { runIntelligenceScan, runBackfill } from "./intelligence.js";
 import { connectGateway, type GatewayHandle, type MessageCreateEvent } from "./gateway.js";
@@ -913,11 +916,10 @@ async function ingestInbound(
     }) as EscalationRecord | null;
     // Backward-compat fallback: check "default" scope if company-scoped read returns null
     if (!record && escalationCompanyId !== "default") {
-      record = await ctx.state.get({
-        scopeKind: "company",
-        scopeId: "default",
-        stateKey: `escalation_${mapping.entityId}`,
-      }) as EscalationRecord | null;
+      record = await readLegacyDefaultScopeState(
+        ctx,
+        `escalation_${mapping.entityId}`,
+      ) as EscalationRecord | null;
     }
 
     // Two state reads happened above; nothing has been written yet.
@@ -1942,6 +1944,19 @@ async function ensureRuntime(
 const plugin = definePlugin({
   async setup(ctx) {
     _pluginCtx = ctx;
+
+    // Degradation reports reach Discord through the live runtime's errors channel.
+    setPluginErrorSink(async (reportCtx, report) => {
+      const rt = runtime;
+      if (!rt) return;
+      const channelId = await resolveChannel(
+        reportCtx,
+        report.companyId ?? rt.companyId,
+        rt.errorsChannelId ?? rt.defaultChannelId,
+      );
+      if (!channelId) return;
+      await postEmbed(reportCtx, rt.token, channelId, formatPluginError(report));
+    });
 
     // Handlers are registered unconditionally.
     //

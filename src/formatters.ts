@@ -418,6 +418,28 @@ export function formatBudgetWarning(data: BudgetWarningData): DiscordMessage {
   };
 }
 
+/** Render a degraded-plugin warning for the errors channel. */
+export function formatPluginError(report: {
+  source: string;
+  summary: string;
+  detail?: string;
+}): DiscordMessage {
+  return {
+    embeds: [
+      {
+        title: "⚠️ Discord plugin degraded",
+        description: report.summary,
+        color: COLORS.ORANGE,
+        ...(report.detail
+          ? { fields: [{ name: "Detail", value: report.detail.slice(0, 1024) }] }
+          : {}),
+        footer: { text: `Paperclip • ${report.source}` },
+        timestamp: new Date().toISOString(),
+      },
+    ],
+  };
+}
+
 // Pick the best human-readable name for an agent run notification.
 // Paperclip's agent.run.* events set entityId = run id (not agent id), so the
 // previous `event.entityId` fallback produced run UUIDs as agent names. Prefer

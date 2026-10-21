@@ -1,4 +1,5 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { readLegacyDefaultScopeState } from "./legacy-state.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -37,7 +38,7 @@ export async function getEscalation(
     if (raw) return raw as EscalationRecord;
   }
   // Backward-compat fallback
-  const fallback = await ctx.state.get({ scopeKind: "company", scopeId: "default", stateKey: key });
+  const fallback = await readLegacyDefaultScopeState(ctx, key);
   return (fallback as EscalationRecord) ?? null;
 }
 
@@ -58,7 +59,7 @@ export async function trackPendingEscalation(
   let raw = await ctx.state.get({ scopeKind: "company", scopeId: escalationCompanyId, stateKey: key });
   // Backward-compat fallback for reads
   if (!raw && escalationCompanyId !== "default") {
-    raw = await ctx.state.get({ scopeKind: "company", scopeId: "default", stateKey: key });
+    raw = await readLegacyDefaultScopeState(ctx, key);
   }
   const ids = (raw as string[]) ?? [];
   if (!ids.includes(escalationId)) {
@@ -79,7 +80,7 @@ export async function untrackPendingEscalation(
   let raw = await ctx.state.get({ scopeKind: "company", scopeId: escalationCompanyId, stateKey: key });
   // Backward-compat fallback for reads
   if (!raw && escalationCompanyId !== "default") {
-    raw = await ctx.state.get({ scopeKind: "company", scopeId: "default", stateKey: key });
+    raw = await readLegacyDefaultScopeState(ctx, key);
   }
   const ids = (raw as string[]) ?? [];
   const filtered = ids.filter((id) => id !== escalationId);
