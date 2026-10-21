@@ -31,6 +31,14 @@ export function humanizePriority(raw: string): string {
   return PRIORITY_LABELS[raw] ?? raw;
 }
 
+/** Base URL for dashboard deep links: the API base under the company prefix. */
+export function buildLinkBaseUrl(baseUrl: string | undefined, issuePrefix?: string | null): string {
+  const base = (baseUrl || DEFAULT_BASE_URL).trim().replace(/\/+$/, "");
+  const prefix = (issuePrefix ?? "").trim().replace(/^\/+|\/+$/g, "");
+  if (!prefix) return base;
+  return `${base}/${encodeURIComponent(prefix)}`;
+}
+
 function resolveBaseUrl(baseUrl?: string): string | null {
   const url = (baseUrl || DEFAULT_BASE_URL).trim();
   const normalized = url.endsWith("/") ? url.slice(0, -1) : url;

@@ -208,6 +208,15 @@ function buildHost(options: HostOptions = {}) {
         const offset = input.offset ?? 0;
         return all.slice(offset, offset + input.limit);
       }),
+      // Scope-gated single-company read, used for the deep-link issue prefix.
+      get: vi.fn(async (companyId: string) => {
+        if (enforceInvocationScope && companyId !== invocationScope) {
+          throw new Error(
+            `requested company "${companyId}" but the current invocation is scoped to company "${invocationScope}"`,
+          );
+        }
+        return { id: companyId, name: `Company ${companyId.slice(0, 4)}`, issuePrefix: "SOO" };
+      }),
     },
     agents: { list: vi.fn(async () => []), invoke: vi.fn() },
     issues: { list: vi.fn(async () => []), get: vi.fn(async () => null), listComments: vi.fn(async () => []) },

@@ -156,7 +156,10 @@ function buildPluginContext(configOverrides: Record<string, unknown> = {}) {
         return () => {};
       }),
     },
-    companies: { list: vi.fn().mockResolvedValue([]) },
+    companies: {
+      list: vi.fn().mockResolvedValue([]),
+      get: vi.fn().mockResolvedValue({ id: "company-1", name: "Acme", issuePrefix: "ACME" }),
+    },
     agents: { list: vi.fn().mockResolvedValue([]), invoke: vi.fn() },
     issues: {
       list: vi.fn().mockResolvedValue([]),

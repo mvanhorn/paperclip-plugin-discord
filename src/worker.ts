@@ -27,7 +27,9 @@ import {
   formatAgentRunStarted,
   formatAgentRunFinished,
   humanizePriority,
+  buildLinkBaseUrl,
 } from "./formatters.js";
+import { resolveCompanyIssuePrefix } from "./company-prefix.js";
 import { handleInteraction, SLASH_COMMANDS, type CommandContext } from "./commands.js";
 import { runIntelligenceScan, runBackfill } from "./intelligence.js";
 import { connectGateway, type GatewayHandle, type MessageCreateEvent } from "./gateway.js";
@@ -232,7 +234,10 @@ type DiscordRuntime = {
   token: string;
   tokenSecretId: string;
   paperclipBoardApiKey: string;
+  /** API base URL, never company-prefixed. */
   baseUrl: string;
+  /** Deep-link base URL: `baseUrl` under the company prefix when resolvable. */
+  linkBaseUrl: string;
   cmdCtx: CommandContext;
   adapter: DiscordAdapter;
   gateway: GatewayHandle | null;
@@ -632,7 +637,7 @@ async function notify(
   );
   if (!channelId) return;
 
-  const message = formatter(event, rt.baseUrl);
+  const message = formatter(event, rt.linkBaseUrl || rt.baseUrl);
   const messageId = await postEmbedWithId(ctx, rt.token, channelId, message);
 
   if (messageId) {
@@ -1287,6 +1292,10 @@ async function bootstrapRuntime(
   rt.tokenSecretId = normalizeSecretRefId(config.discordBotTokenRef) ?? "";
   rt.paperclipBoardApiKey = paperclipBoardApiKey;
   rt.baseUrl = baseUrl;
+  rt.linkBaseUrl = buildLinkBaseUrl(
+    baseUrl,
+    await resolveCompanyIssuePrefix(ctx, companyId, baseUrl, paperclipBoardApiKey),
+  );
   rt.cmdCtx = {
     baseUrl,
     companyId,

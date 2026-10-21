@@ -164,7 +164,10 @@ function buildHost() {
       emit: vi.fn(),
       subscribe: vi.fn(),
     },
-    companies: { list: vi.fn(async () => [{ id: COMPANY_A, name: "A" }]) },
+    companies: {
+      list: vi.fn(async () => [{ id: COMPANY_A, name: "A" }]),
+      get: vi.fn(async () => ({ id: COMPANY_A, name: "A", issuePrefix: "AAA" })),
+    },
     agents: { list: vi.fn(async () => []), invoke: vi.fn() },
     issues: { list: vi.fn(async () => []), get: vi.fn(async () => null), listComments: vi.fn(async () => []) },
     // Discord REST. A posted embed answers with its message id, which is what
