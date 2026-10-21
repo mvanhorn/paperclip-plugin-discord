@@ -202,6 +202,44 @@ function humanizeActorLabel(value: string | null): string | null {
   return trimmed;
 }
 
+function renderLinkedIssueDetail(issue: Record<string, unknown>): string {
+  const parts = [`**${issue.identifier ?? "?"}** ${issue.title ?? ""}`];
+  const meta: string[] = [];
+  if (issue.status) meta.push(String(issue.status));
+  if (issue.priority) meta.push(String(issue.priority));
+  if (issue.assignee) meta.push(`→ ${issue.assignee}`);
+  if (meta.length > 0) parts.push(`(${meta.join(" | ")})`);
+  if (issue.description) parts.push(`\n> ${String(issue.description).slice(0, 100)}`);
+  return parts.join(" ");
+}
+
+/** One line per linked issue: the resolved detail when enrichment found it, a dashboard deep link otherwise. */
+function renderLinkedIssueLines(
+  issueIds: string[],
+  linkedIssues: Array<Record<string, unknown>>,
+  dashboardBase: string | null,
+): string[] {
+  const byId = new Map<string, Record<string, unknown>>();
+  const unkeyed: Array<Record<string, unknown>> = [];
+  for (const issue of linkedIssues) {
+    const id = typeof issue.id === "string" ? issue.id : null;
+    if (id) byId.set(id, issue);
+    else unkeyed.push(issue);
+  }
+
+  const lines: string[] = [];
+  const seen = new Set<string>();
+  for (const id of [...issueIds, ...byId.keys()]) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const issue = byId.get(id);
+    if (issue) lines.push(renderLinkedIssueDetail(issue));
+    else lines.push(dashboardBase ? `[${id.slice(0, 8)}](${dashboardBase}/issues/${id})` : id);
+  }
+  for (const issue of unkeyed) lines.push(renderLinkedIssueDetail(issue));
+  return lines;
+}
+
 export function formatApprovalCreated(event: PluginEvent, baseUrl?: string): DiscordMessage {
   const p = event.payload as Payload;
   const approvalType = String(p.type ?? "unknown");
@@ -215,32 +253,31 @@ export function formatApprovalCreated(event: PluginEvent, baseUrl?: string): Dis
   const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
   if (agentName) fields.push({ name: "Agent", value: agentName, inline: true });
   fields.push({ name: "Type", value: `\`${approvalType}\``, inline: true });
-  if (issueIds.length > 0) {
-    fields.push({ name: "Linked Issues", value: issueIds.join(", ") });
-  }
 
   const linkedIssues = Array.isArray(p.linkedIssues) ? p.linkedIssues as Array<Record<string, unknown>> : [];
-  if (linkedIssues.length > 0) {
-    const issueLines = linkedIssues.map((issue) => {
-      const parts = [`**${issue.identifier ?? "?"}** ${issue.title ?? ""}`];
-      const meta: string[] = [];
-      if (issue.status) meta.push(String(issue.status));
-      if (issue.priority) meta.push(String(issue.priority));
-      if (issue.assignee) meta.push(`→ ${issue.assignee}`);
-      if (meta.length > 0) parts.push(`(${meta.join(" | ")})`);
-      if (issue.description) parts.push(`\n> ${String(issue.description).slice(0, 100)}`);
-      return parts.join(" ");
+  const issueLines = renderLinkedIssueLines(issueIds, linkedIssues, dashboardBase);
+  if (issueLines.length > 0) {
+    fields.push({
+      name: issueLines.length === 1 ? "Linked Issue" : `Linked Issues (${issueLines.length})`,
+      value: issueLines.join("\n\n").slice(0, 1024),
     });
-    fields.push({ name: `Linked Issues (${linkedIssues.length})`, value: issueLines.join("\n\n").slice(0, 1024) });
   }
 
-  const knownKeys = new Set(["type", "approvalId", "title", "description", "agentName", "issueIds", "agentId", "runId", "linkedIssues"]);
+  const knownKeys = new Set(["type", "approvalId", "title", "description", "agentName", "issueIds", "agentId", "runId", "linkedIssues", "enrichmentDegraded", "failedIssueIds"]);
   for (const [key, value] of Object.entries(p)) {
     if (knownKeys.has(key) || value == null || value === "") continue;
     const display = typeof value === "object" ? JSON.stringify(value) : String(value);
     if (display.length > 0 && display.length <= 1024) {
       fields.push({ name: key, value: display, inline: display.length < 40 });
     }
+  }
+
+  const failedIssueIds = Array.isArray(p.failedIssueIds) ? p.failedIssueIds as string[] : [];
+  let footerText = "Paperclip";
+  if (p.enrichmentDegraded === true) {
+    footerText += failedIssueIds.length > 0
+      ? ` • ⚠️ 일부 연결 이슈 정보를 불러오지 못했습니다 (${failedIssueIds.length}건)`
+      : " • ⚠️ 일부 승인 정보를 불러오지 못했습니다";
   }
 
   return {
@@ -250,7 +287,7 @@ export function formatApprovalCreated(event: PluginEvent, baseUrl?: string): Dis
         description: description || undefined,
         color: COLORS.YELLOW,
         fields,
-        footer: { text: "Paperclip" },
+        footer: { text: footerText },
         timestamp: event.occurredAt,
       },
     ],

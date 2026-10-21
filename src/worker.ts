@@ -32,7 +32,8 @@ import {
 } from "./formatters.js";
 import { resolveCompanyIssuePrefix } from "./company-prefix.js";
 import { readLegacyDefaultScopeState } from "./legacy-state.js";
-import { setPluginErrorSink } from "./error-reporting.js";
+import { fetchApprovalRecord } from "./approval-details.js";
+import { setPluginErrorSink, reportPluginError } from "./error-reporting.js";
 import { handleInteraction, SLASH_COMMANDS, type CommandContext } from "./commands.js";
 import { runIntelligenceScan, runBackfill } from "./intelligence.js";
 import { connectGateway, type GatewayHandle, type MessageCreateEvent } from "./gateway.js";
@@ -571,6 +572,130 @@ export async function enrichRunPayload(
       agentId,
       issueId,
       error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  return payload;
+}
+
+/** How many linked issues an approval card resolves before it stops looking. */
+const MAX_ENRICHED_LINKED_ISSUES = 5;
+
+/** Fill an `approval.created` payload with the approval row, requester name and linked issue detail. Never throws. */
+export async function enrichApprovalPayload(
+  ctx: PluginContext,
+  event: PluginEvent,
+  opts: { companyId?: string; baseUrl: string; apiKey?: string },
+): Promise<Record<string, unknown>> {
+  const payload = { ...(event.payload as Record<string, unknown>) };
+  const approvalId =
+    (typeof payload.approvalId === "string" && payload.approvalId) || event.entityId || "";
+  if (!approvalId) return payload;
+  payload.approvalId = approvalId;
+
+  const companyId =
+    (typeof event.companyId === "string" && event.companyId) || opts.companyId || "";
+
+  const degradedDetails: string[] = [];
+  const failedIssueIds: string[] = [];
+
+  try {
+    const approval = await fetchApprovalRecord(
+      ctx,
+      approvalId,
+      companyId,
+      opts.baseUrl,
+      opts.apiKey,
+    );
+    if (approval) {
+      // The event payload is the record of what fired, so it wins on conflict.
+      for (const [key, value] of Object.entries(approval.payload ?? {})) {
+        if (payload[key] == null) payload[key] = value;
+      }
+      if (payload.type == null && approval.type) payload.type = approval.type;
+      if (payload.agentId == null && approval.requestedByAgentId) {
+        payload.agentId = approval.requestedByAgentId;
+      }
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    degradedDetails.push(`approval record: ${detail}`);
+    ctx.logger.debug("Approval record lookup failed", { approvalId, error: detail });
+  }
+
+  try {
+    const requesterAgentId =
+      (typeof payload.agentId === "string" && payload.agentId) ||
+      (typeof event.actorId === "string" && event.actorId) ||
+      null;
+    if (!payload.agentName && requesterAgentId && companyId) {
+      const agents = (await ctx.agents.list({ companyId })) as Array<{ id: string; name: string }>;
+      const match = agents.find((a) => a.id === requesterAgentId);
+      if (match?.name) payload.agentName = match.name;
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    degradedDetails.push(`requester name: ${detail}`);
+    ctx.logger.debug("Approval requester name lookup failed", { approvalId, error: detail });
+  }
+
+  try {
+    if (!Array.isArray(payload.linkedIssues) && companyId) {
+      const issueIds = Array.isArray(payload.issueIds)
+        ? (payload.issueIds as unknown[]).filter((id): id is string => typeof id === "string")
+        : [];
+      const linked: Array<Record<string, unknown>> = [];
+      for (const issueId of issueIds.slice(0, MAX_ENRICHED_LINKED_ISSUES)) {
+        try {
+          const issue = (await ctx.issues.get(issueId, companyId)) as {
+            id: string;
+            identifier?: string | null;
+            title?: string | null;
+            status?: string | null;
+            priority?: string | null;
+          } | null;
+          if (issue) {
+            linked.push({
+              id: issue.id,
+              identifier: issue.identifier ?? null,
+              title: issue.title ?? null,
+              status: issue.status ?? null,
+              priority: issue.priority ?? null,
+            });
+          }
+        } catch (error) {
+          failedIssueIds.push(issueId);
+          ctx.logger.debug("Linked issue lookup failed", {
+            approvalId,
+            issueId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      if (linked.length > 0) payload.linkedIssues = linked;
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    degradedDetails.push(`linked issues: ${detail}`);
+    ctx.logger.debug("Approval linked issue enrichment failed", { approvalId, error: detail });
+  }
+
+  if (failedIssueIds.length > 0) {
+    payload.failedIssueIds = failedIssueIds;
+    degradedDetails.push(`unresolved linked issues: ${failedIssueIds.join(", ")}`);
+  }
+
+  if (degradedDetails.length > 0) {
+    payload.enrichmentDegraded = true;
+    await reportPluginError(ctx, {
+      source: "approval-enrichment",
+      summary:
+        failedIssueIds.length > 0
+          ? `Approval \`${approvalId}\` could not resolve ${failedIssueIds.length} linked issue(s); the card falls back to deep links.`
+          : `Approval \`${approvalId}\` was enriched only partially; the card may be missing detail.`,
+      detail: degradedDetails.join("\n"),
+      companyId: companyId || undefined,
+      dedupKey: `approval-enrichment:${approvalId}`,
     });
   }
 
@@ -2023,10 +2148,15 @@ const plugin = definePlugin({
     ctx.events.on("approval.created", async (event: PluginEvent) => {
       const rt = await ensureRuntime(ctx, event.companyId);
       if (!rt || !rt.config.notifyOnApprovalCreated) return;
+      const payload = await enrichApprovalPayload(ctx, event, {
+        companyId: rt.companyId,
+        baseUrl: rt.baseUrl,
+        apiKey: rt.paperclipBoardApiKey,
+      });
       await notify(
         ctx,
         rt,
-        event,
+        { ...event, payload },
         formatApprovalCreated,
         rt.approvalsChannelId ?? undefined,
         rt.config.approvalsChannels,
