@@ -459,3 +459,28 @@ describe("event deduplication", () => {
     expect(mockDiscordFetch.mock.calls.length).toBe(firstCallCount);
   });
 });
+
+describe("agent run notifications toggle", () => {
+  const channelPosts = (fetch: ReturnType<typeof vi.fn>) =>
+    fetch.mock.calls.filter((call: any[]) => typeof call[0] === "string" && call[0].includes("/channels/"));
+
+  for (const eventType of ["agent.run.started", "agent.run.finished"]) {
+    it(`${eventType}: posts by default`, async () => {
+      const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext();
+      await getSetup()(ctx);
+
+      await emitEvent(eventHandlers, eventType, makeEvent(eventType, `evt-${eventType}-on`));
+      expect(channelPosts(mockDiscordFetch)).toHaveLength(1);
+    });
+
+    it(`${eventType}: skipped when notifyOnAgentRun is false`, async () => {
+      const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext({
+        notifyOnAgentRun: false,
+      });
+      await getSetup()(ctx);
+
+      await emitEvent(eventHandlers, eventType, makeEvent(eventType, `evt-${eventType}-off`));
+      expect(channelPosts(mockDiscordFetch)).toHaveLength(0);
+    });
+  }
+});

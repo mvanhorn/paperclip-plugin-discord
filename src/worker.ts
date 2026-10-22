@@ -81,6 +81,7 @@ type DiscordConfig = {
   notifyOnIssueDone: boolean;
   notifyOnApprovalCreated: boolean;
   notifyOnAgentError: boolean;
+  notifyOnAgentRun: boolean;
   enableIntelligence: boolean;
   intelligenceChannelIds: string[];
   backfillDays: number;
@@ -2074,13 +2075,13 @@ const plugin = definePlugin({
 
     ctx.events.on("agent.run.started", async (event: PluginEvent) => {
       const rt = await ensureRuntime(ctx, event.companyId);
-      if (!rt) return;
+      if (!rt || !rt.config.notifyOnAgentRun) return;
       const payload = await enrichRunPayload(ctx, event);
       await notify(ctx, rt, { ...event, payload }, formatAgentRunStarted, rt.bdPipelineChannelId ?? undefined);
     });
     ctx.events.on("agent.run.finished", async (event: PluginEvent) => {
       const rt = await ensureRuntime(ctx, event.companyId);
-      if (!rt) return;
+      if (!rt || !rt.config.notifyOnAgentRun) return;
       const payload = await enrichRunPayload(ctx, event);
       await notify(ctx, rt, { ...event, payload }, formatAgentRunFinished, rt.bdPipelineChannelId ?? undefined);
     });

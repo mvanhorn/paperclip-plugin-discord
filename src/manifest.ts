@@ -137,6 +137,11 @@ const manifest: PaperclipPluginManifestV1 = {
         title: "Notify on agent error",
         default: DEFAULT_CONFIG.notifyOnAgentError,
       },
+      notifyOnAgentRun: {
+        type: "boolean",
+        title: "Notify on agent run started/finished",
+        default: DEFAULT_CONFIG.notifyOnAgentRun,
+      },
       enableIntelligence: {
         type: "boolean",
         title: "Enable community intelligence",

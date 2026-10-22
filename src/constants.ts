@@ -29,6 +29,7 @@ export const DEFAULT_CONFIG = {
   notifyOnIssueDone: true,
   notifyOnApprovalCreated: true,
   notifyOnAgentError: true,
+  notifyOnAgentRun: true,
   enableIntelligence: false,
   intelligenceChannelIds: [] as string[],
   escalationChannelId: "",
