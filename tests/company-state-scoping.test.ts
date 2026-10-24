@@ -13,6 +13,7 @@ import {
   untrackPendingEscalation,
   collectPendingEscalationIds,
 } from "../src/escalation-state.js";
+import { resetLegacyDefaultRefusal } from "../src/legacy-scope.js";
 
 // ---------------------------------------------------------------------------
 // Scope-aware state mock
@@ -424,6 +425,74 @@ describe("company-aware state scoping", () => {
 
       expect(idsA).toEqual(["esc-a"]);
       expect(idsB).toEqual(["esc-b"]);
+    });
+  });
+
+  // Newer Paperclip hosts refuse state reads for a scope that is not a real
+  // company, so the legacy "default" fallback throws instead of returning null.
+  describe("when the host refuses the legacy 'default' scope", () => {
+    let ctx: ReturnType<typeof makeScopedCtx>;
+
+    beforeEach(() => {
+      resetLegacyDefaultRefusal();
+      ctx = makeScopedCtx();
+      const allowed = ctx.state.get.getMockImplementation()!;
+      ctx.state.get.mockImplementation((key: { scopeId: string; stateKey: string }) => {
+        if (key.scopeId === "default") {
+          return Promise.reject(new Error(
+            'Plugin "p" is not allowed to perform "state.get": company context is required',
+          ));
+        }
+        return allowed(key);
+      });
+    });
+
+    it("collectPendingEscalationIds returns the company's ids", async () => {
+      stateStore.set(scopedKey("comp-1", "escalation_pending_ids"), ["esc-1"]);
+      await expect(collectPendingEscalationIds(ctx as any, "comp-1")).resolves.toEqual(["esc-1"]);
+    });
+
+    it("getEscalation returns null for an unknown company record", async () => {
+      await expect(getEscalation(ctx as any, "esc-missing", "comp-1")).resolves.toBeNull();
+    });
+
+    it("getEscalation still returns the company record", async () => {
+      const record = makeEscalation();
+      stateStore.set(scopedKey("comp-1", "escalation_esc-1"), record);
+      await expect(getEscalation(ctx as any, "esc-1", "comp-1")).resolves.toEqual(record);
+    });
+
+    it("trackPendingEscalation starts a new company list", async () => {
+      await trackPendingEscalation(ctx as any, "esc-1", "comp-1");
+      expect(stateStore.get(scopedKey("comp-1", "escalation_pending_ids"))).toEqual(["esc-1"]);
+    });
+
+    it("getThreadSessions returns no sessions for a thread without company data", async () => {
+      await expect(getThreadSessions(ctx as any, "thread-x", "comp-1")).resolves.toEqual([]);
+    });
+
+    it("asks the host for the legacy scope only once after a refusal", async () => {
+      await collectPendingEscalationIds(ctx as any, "comp-1");
+      await collectPendingEscalationIds(ctx as any, "comp-1");
+      const defaultReads = ctx.state.get.mock.calls.filter(([key]: [{ scopeId: string }]) => key.scopeId === "default");
+      expect(defaultReads).toHaveLength(1);
+    });
+
+    it("propagates a legacy read failure that is not a refusal", async () => {
+      ctx.state.get.mockImplementation((key: { scopeId: string; stateKey: string }) =>
+        key.scopeId === "default"
+          ? Promise.reject(new Error("worker RPC timed out"))
+          : Promise.resolve(stateStore.get(scopedKey(key.scopeId, key.stateKey)) ?? null));
+      await expect(getThreadSessions(ctx as any, "thread-x", "comp-1")).rejects.toThrow(/timed out/);
+    });
+
+    it("getThreadSessions still propagates the refusal without a company", async () => {
+      await expect(getThreadSessions(ctx as any, "thread-x")).rejects.toThrow(/not allowed/);
+    });
+
+    it("untrackPendingEscalation works on an empty company list", async () => {
+      await untrackPendingEscalation(ctx as any, "esc-1", "comp-1");
+      expect(stateStore.get(scopedKey("comp-1", "escalation_pending_ids"))).toEqual([]);
     });
   });
 });

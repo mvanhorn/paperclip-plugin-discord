@@ -10,6 +10,7 @@ import {
   ACP_PLUGIN_EVENT_PREFIX,
   METRIC_NAMES,
 } from "./constants.js";
+import { readLegacyDefault } from "./legacy-scope.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -146,7 +147,7 @@ export async function getThreadSessions(
     if (raw) return (raw as ThreadSessions).sessions ?? [];
   }
   // Backward-compat fallback: read from "default" scope
-  const fallback = await ctx.state.get({ scopeKind: "company", scopeId: "default", stateKey: key });
+  const fallback = await readLegacyDefault(ctx, key, companyId);
   if (!fallback) return [];
   return (fallback as ThreadSessions).sessions ?? [];
 }
@@ -169,7 +170,7 @@ async function getHandoff(ctx: PluginContext, handoffId: string, companyId?: str
     const raw = await ctx.state.get({ scopeKind: "company", scopeId: companyId, stateKey: key });
     if (raw) return raw as HandoffRecord;
   }
-  const fallback = await ctx.state.get({ scopeKind: "company", scopeId: "default", stateKey: key });
+  const fallback = await readLegacyDefault(ctx, key, companyId);
   return (fallback as HandoffRecord) ?? null;
 }
 
@@ -187,7 +188,7 @@ async function getDiscussion(ctx: PluginContext, id: string, companyId?: string)
     const raw = await ctx.state.get({ scopeKind: "company", scopeId: companyId, stateKey: key });
     if (raw) return raw as DiscussionLoop;
   }
-  const fallback = await ctx.state.get({ scopeKind: "company", scopeId: "default", stateKey: key });
+  const fallback = await readLegacyDefault(ctx, key, companyId);
   return (fallback as DiscussionLoop) ?? null;
 }
 
@@ -205,7 +206,7 @@ async function findActiveDiscussion(ctx: PluginContext, threadId: string, compan
     const raw = await ctx.state.get({ scopeKind: "company", scopeId: companyId, stateKey: key });
     if (raw) return raw as string;
   }
-  const fallback = await ctx.state.get({ scopeKind: "company", scopeId: "default", stateKey: key });
+  const fallback = await readLegacyDefault(ctx, key, companyId);
   return (fallback as string) ?? null;
 }
 

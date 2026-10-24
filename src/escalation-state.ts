@@ -1,4 +1,5 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { readLegacyDefault } from "./legacy-scope.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -37,7 +38,7 @@ export async function getEscalation(
     if (raw) return raw as EscalationRecord;
   }
   // Backward-compat fallback
-  const fallback = await ctx.state.get({ scopeKind: "company", scopeId: "default", stateKey: key });
+  const fallback = await readLegacyDefault(ctx, key, escalationCompanyId);
   return (fallback as EscalationRecord) ?? null;
 }
 
@@ -58,7 +59,7 @@ export async function trackPendingEscalation(
   let raw = await ctx.state.get({ scopeKind: "company", scopeId: escalationCompanyId, stateKey: key });
   // Backward-compat fallback for reads
   if (!raw && escalationCompanyId !== "default") {
-    raw = await ctx.state.get({ scopeKind: "company", scopeId: "default", stateKey: key });
+    raw = await readLegacyDefault(ctx, key, escalationCompanyId);
   }
   const ids = (raw as string[]) ?? [];
   if (!ids.includes(escalationId)) {
@@ -79,7 +80,7 @@ export async function untrackPendingEscalation(
   let raw = await ctx.state.get({ scopeKind: "company", scopeId: escalationCompanyId, stateKey: key });
   // Backward-compat fallback for reads
   if (!raw && escalationCompanyId !== "default") {
-    raw = await ctx.state.get({ scopeKind: "company", scopeId: "default", stateKey: key });
+    raw = await readLegacyDefault(ctx, key, escalationCompanyId);
   }
   const ids = (raw as string[]) ?? [];
   const filtered = ids.filter((id) => id !== escalationId);
@@ -101,11 +102,13 @@ export async function collectPendingEscalationIds(
   const seenIds = new Set<string>();
   const pendingIds: string[] = [];
   for (const sid of scopeIds) {
-    const raw = await ctx.state.get({
-      scopeKind: "company",
-      scopeId: sid,
-      stateKey: "escalation_pending_ids",
-    });
+    const raw = sid === "default"
+      ? await readLegacyDefault(ctx, "escalation_pending_ids", companyId)
+      : await ctx.state.get({
+        scopeKind: "company",
+        scopeId: sid,
+        stateKey: "escalation_pending_ids",
+      });
     for (const id of ((raw as string[]) ?? [])) {
       if (!seenIds.has(id)) {
         seenIds.add(id);
