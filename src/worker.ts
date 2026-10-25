@@ -416,6 +416,7 @@ async function enrichIssueNotificationPayload(
       executionAgentNameKey?: string | null;
       completedAt?: Date | string | null;
       updatedAt?: Date | string | null;
+      projectId?: string | null;
       project?: { name?: string | null } | null;
     } | null;
 
@@ -439,6 +440,24 @@ async function enrichIssueNotificationPayload(
       if (payload.completedAt == null && issue.completedAt) payload.completedAt = String(issue.completedAt);
       if (payload.updatedAt == null && issue.updatedAt) payload.updatedAt = String(issue.updatedAt);
       if (payload.projectName == null && issue.project?.name) payload.projectName = issue.project.name;
+      // On this host, issues.get returns the issue without a `project` relation — only the
+      // REST route GET /api/issues/:id adds it — so projectName stays null and topic routing
+      // always falls back to the default channel. When the name is still missing but we have a
+      // projectId, resolve it via projects.get (manifest declares the projects.read capability).
+      // Fail soft in a scoped try/catch: a lookup error must never drop or block the
+      // notification, and must not skip the "done"-event enrichment below.
+      if (payload.projectName == null && issue.projectId) {
+        try {
+          const project = await ctx.projects.get(issue.projectId, companyId);
+          if (project?.name) payload.projectName = project.name;
+        } catch (error) {
+          ctx.logger.debug("Project name lookup failed", {
+            issueId: event.entityId,
+            projectId: issue.projectId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
     }
 
     if (String(payload.status ?? "") === "done") {

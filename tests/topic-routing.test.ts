@@ -143,6 +143,9 @@ function buildPluginContext(configOverrides: Record<string, unknown> = {}, state
       get: vi.fn().mockResolvedValue(null),
       listComments: vi.fn().mockResolvedValue([]),
     },
+    projects: {
+      get: vi.fn().mockResolvedValue(null),
+    },
     http: { fetch: mockDiscordFetch },
   } as any;
 
@@ -316,6 +319,91 @@ describe("topic routing", () => {
     );
     expect(postCall).toBeDefined();
     expect(postCall![0]).toContain("1234567890123456789");
+    // The project relation was already present, so no extra projects.get lookup is needed.
+    expect(ctx.projects.get).not.toHaveBeenCalled();
+  });
+
+  it("resolves projectName via projects.get when issues.get returns a projectId but no project relation", async () => {
+    const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext(
+      { topicRouting: true, notifyOnIssueCreated: true },
+      { "channel-project-map": { "my-project": "1234567890123456789" } },
+    );
+    // Our host returns the issue with a projectId but no `project` relation — the exact
+    // shape that left projectName null and broke topic routing.
+    ctx.issues.get = vi.fn().mockResolvedValue({
+      id: "entity-1",
+      identifier: "TST-7",
+      title: "Created issue",
+      status: "todo",
+      projectId: "proj-123",
+    });
+    ctx.projects.get = vi.fn().mockResolvedValue({ id: "proj-123", name: "my-project" });
+
+    await getSetup()(ctx);
+
+    const event = makeEvent("issue.created", "evt-topic-7", {
+      title: "Created issue",
+      identifier: "TST-7",
+    });
+
+    await emitEvent(eventHandlers, "issue.created", event);
+
+    // projects.get must have been consulted with (projectId, companyId) to recover the name.
+    expect(ctx.projects.get).toHaveBeenCalledTimes(1);
+    expect(ctx.projects.get).toHaveBeenCalledWith("proj-123", "company-1");
+
+    const postCall = mockDiscordFetch.mock.calls.find(
+      (call: any[]) => typeof call[0] === "string" && call[0].includes("/channels/"),
+    );
+    expect(postCall).toBeDefined();
+    expect(postCall![0]).toContain("1234567890123456789");
+  });
+
+  it("falls back to the default channel and still posts a complete done embed when projects.get throws", async () => {
+    // A done event exercises the scope of the fail-soft try/catch: if the projects.get error
+    // were caught by the function-wide catch instead of a catch scoped to the lookup, control
+    // would jump past the done-enrichment block and the embed would lose its Summary/Completed-by.
+    const { ctx, eventHandlers, mockDiscordFetch } = buildPluginContext(
+      { topicRouting: true, notifyOnIssueDone: true },
+      { "channel-project-map": { "my-project": "1234567890123456789" } },
+    );
+    ctx.issues.get = vi.fn().mockResolvedValue({
+      id: "entity-1",
+      identifier: "TST-8",
+      title: "Finished issue",
+      status: "done",
+      completedAt: "2026-10-25T18:00:00.000Z",
+      projectId: "proj-123",
+    });
+    ctx.issues.listComments = vi.fn().mockResolvedValue([
+      { authorAgentId: "agent-1", body: "All checks green, shipping.", createdAt: "2026-10-25T17:59:00.000Z" },
+    ]);
+    ctx.projects.get = vi.fn().mockRejectedValue(new Error("projects.get boom"));
+
+    await getSetup()(ctx);
+
+    const event = makeEvent("issue.updated", "evt-topic-8", {
+      title: "Finished issue",
+      identifier: "TST-8",
+      status: "done",
+    });
+
+    await emitEvent(eventHandlers, "issue.updated", event);
+
+    // The lookup was attempted and the error was caught — notification still posts,
+    // routed to the default channel because projectName could not be resolved.
+    expect(ctx.projects.get).toHaveBeenCalledTimes(1);
+    const postCall = mockDiscordFetch.mock.calls.find(
+      (call: any[]) => typeof call[0] === "string" && call[0].includes("/channels/"),
+    );
+    expect(postCall).toBeDefined();
+    expect(postCall![0]).toContain("ch-default");
+
+    // Crucially, the done-enrichment ran *after* the throw: the embed carries the last
+    // comment as its Summary. Proving the catch is scoped to the lookup, not the whole function.
+    const body = JSON.parse(postCall![1].body as string);
+    const summaryField = body.embeds?.[0]?.fields?.find((f: any) => f.name === "Summary");
+    expect(summaryField?.value).toContain("All checks green, shipping.");
   });
 
   it("rejects non-string set-channel inputs so truncated numeric snowflakes cannot be stored", async () => {
