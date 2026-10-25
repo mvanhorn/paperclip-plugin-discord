@@ -105,6 +105,38 @@ const manifest: PaperclipPluginManifestV1 = {
         additionalProperties: { type: "string" },
         default: DEFAULT_CONFIG.approvalsChannels,
       },
+      errorsChannels: {
+        type: "object",
+        title: "Per-company errors channel overrides",
+        description:
+          "Route agent.run.failed and budget-warning events to a specific channel per company. Keys are company UUIDs, values are Discord channel IDs. Checked before companyChannels; falls through to errorsChannelId (global) when unset.",
+        additionalProperties: { type: "string" },
+        default: DEFAULT_CONFIG.errorsChannels,
+      },
+      escalationsChannels: {
+        type: "object",
+        title: "Per-company escalations channel overrides",
+        description:
+          "Route escalation-created and escalate_to_human events to a specific channel per company. Keys are company UUIDs, values are Discord channel IDs. Checked before companyChannels; falls through to escalationChannelId (global) when unset.",
+        additionalProperties: { type: "string" },
+        default: DEFAULT_CONFIG.escalationsChannels,
+      },
+      pipelineChannels: {
+        type: "object",
+        title: "Per-company pipeline channel overrides",
+        description:
+          "Route agent.run.started and agent.run.finished events to a specific channel per company. Keys are company UUIDs, values are Discord channel IDs. Checked before companyChannels; falls through to bdPipelineChannelId (global) when unset.",
+        additionalProperties: { type: "string" },
+        default: DEFAULT_CONFIG.pipelineChannels,
+      },
+      digestChannels: {
+        type: "object",
+        title: "Per-company digest channel overrides",
+        description:
+          "Route daily/bidaily/tridaily digest summaries to a specific channel per company. Keys are company UUIDs, values are Discord channel IDs. Checked before companyChannels; falls through to defaultChannelId (global) when unset.",
+        additionalProperties: { type: "string" },
+        default: DEFAULT_CONFIG.digestChannels,
+      },
       errorsChannelId: {
         type: "string",
         title: "Errors Channel ID",

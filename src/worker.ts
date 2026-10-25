@@ -118,6 +118,30 @@ type DiscordConfig = {
    * different companies have dedicated approvals channels.
    */
   approvalsChannels?: Record<string, string>;
+  /**
+   * Per-company error channel overrides. Checked for `agent.run.failed` and
+   * budget-warning events before `companyChannels`; falls through to
+   * `errorsChannelId` (global) when a company is not mapped.
+   */
+  errorsChannels?: Record<string, string>;
+  /**
+   * Per-company escalation channel overrides. Checked for `escalation-created`
+   * and `escalate_to_human` events before `companyChannels`; falls through to
+   * `escalationChannelId` (global) when a company is not mapped.
+   */
+  escalationsChannels?: Record<string, string>;
+  /**
+   * Per-company pipeline channel overrides. Checked for `agent.run.started` and
+   * `agent.run.finished` events before `companyChannels`; falls through to
+   * `bdPipelineChannelId` (global) when a company is not mapped.
+   */
+  pipelineChannels?: Record<string, string>;
+  /**
+   * Per-company digest channel overrides. Checked for daily/bidaily/tridaily
+   * digest summaries before `companyChannels`; falls through to
+   * `defaultChannelId` (global) when a company is not mapped.
+   */
+  digestChannels?: Record<string, string>;
 };
 
 type IssueNotificationPayload = Record<string, unknown>;
@@ -2069,20 +2093,20 @@ const plugin = definePlugin({
     ctx.events.on("agent.run.failed", async (event: PluginEvent) => {
       const rt = await ensureRuntime(ctx, event.companyId);
       if (!rt || !rt.config.notifyOnAgentError) return;
-      await notify(ctx, rt, event, formatSessionFailure, rt.errorsChannelId ?? undefined);
+      await notify(ctx, rt, event, formatSessionFailure, rt.errorsChannelId ?? undefined, rt.config.errorsChannels);
     });
 
     ctx.events.on("agent.run.started", async (event: PluginEvent) => {
       const rt = await ensureRuntime(ctx, event.companyId);
       if (!rt) return;
       const payload = await enrichRunPayload(ctx, event);
-      await notify(ctx, rt, { ...event, payload }, formatAgentRunStarted, rt.bdPipelineChannelId ?? undefined);
+      await notify(ctx, rt, { ...event, payload }, formatAgentRunStarted, rt.bdPipelineChannelId ?? undefined, rt.config.pipelineChannels);
     });
     ctx.events.on("agent.run.finished", async (event: PluginEvent) => {
       const rt = await ensureRuntime(ctx, event.companyId);
       if (!rt) return;
       const payload = await enrichRunPayload(ctx, event);
-      await notify(ctx, rt, { ...event, payload }, formatAgentRunFinished, rt.bdPipelineChannelId ?? undefined);
+      await notify(ctx, rt, { ...event, payload }, formatAgentRunFinished, rt.bdPipelineChannelId ?? undefined, rt.config.pipelineChannels);
     });
 
     // ===================================================================
@@ -2108,7 +2132,7 @@ const plugin = definePlugin({
       const escalationId = payload.escalationId || event.entityId || "";
       payload.escalationId = escalationId;
 
-      const channelId = await resolveChannel(ctx, event.companyId, rt.escalationChannelId);
+      const channelId = await resolveChannel(ctx, event.companyId, rt.escalationChannelId, rt.config.escalationsChannels);
       if (!channelId) return;
 
       const { embeds, components } = buildEscalationEmbed(payload);
@@ -2192,7 +2216,7 @@ const plugin = definePlugin({
           suggestedReply: p.suggestedReply ? String(p.suggestedReply) : undefined,
         };
 
-        const channelId = await resolveChannel(ctx, escalationCompanyId, rt.escalationChannelId);
+        const channelId = await resolveChannel(ctx, escalationCompanyId, rt.escalationChannelId, rt.config.escalationsChannels);
         if (!channelId) {
           return { error: "No escalation channel configured." };
         }
@@ -2421,6 +2445,7 @@ const plugin = definePlugin({
           ctx,
           jobCompanyId,
           rt.errorsChannelId ?? rt.defaultChannelId,
+          rt.config.errorsChannels,
         );
         if (!channelId) continue;
 
@@ -2583,7 +2608,7 @@ const plugin = definePlugin({
 
       const companies = await ctx.companies.list();
       for (const company of companies) {
-        const channelId = await resolveChannel(ctx, company.id, rt.defaultChannelId);
+        const channelId = await resolveChannel(ctx, company.id, rt.defaultChannelId, rt.config.digestChannels);
         if (!channelId) continue;
 
         try {

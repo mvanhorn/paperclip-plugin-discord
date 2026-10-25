@@ -48,6 +48,10 @@ export const DEFAULT_CONFIG = {
   tridailyTimes: "07:00,13:00,19:00",
   companyChannels: {} as Record<string, string>,
   approvalsChannels: {} as Record<string, string>,
+  errorsChannels: {} as Record<string, string>,
+  escalationsChannels: {} as Record<string, string>,
+  pipelineChannels: {} as Record<string, string>,
+  digestChannels: {} as Record<string, string>,
 } as const;
 
 export const DISCORD_API_BASE = "https://discord.com/api/v10";
